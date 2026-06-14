@@ -222,7 +222,78 @@ def ingest_day(
     result.attrs["max_gap_fill_s"]  = max_gap_fill_s
     result.attrs["pipeline_module"] = "module1 v1.0"
 
+    # ------------------------------------------------------------------ #
+    # 3. Day-level summary attributes (used by Module 4 training loop)
+    # ------------------------------------------------------------------ #
+    result.attrs.update(_compute_day_summary(result, cadence_s))
+
     return result
+
+
+def _compute_day_summary(ds: "xr.Dataset", cadence_s: float) -> dict:
+    """
+    Compute day-level summary flags stored as Dataset attributes.
+
+    Module 4 uses these to categorise days as quiet (negative training
+    examples) vs active (positive examples) without re-reading the full file.
+
+    quiet_day heuristic: no cadence in Band A exceeds 5× the day median.
+    This is conservative — even a modest C-class flare produces >10× rise.
+    Update the threshold once you have verified GOES-cross-matched events.
+    """
+    from .quality import is_usable, QFlag
+
+    summary: dict = {}
+
+    # ── Usable fraction (across all detectors that have a quality var) ──
+    q_vars = [v for v in ds.data_vars if v.endswith("_quality")]
+    if q_vars:
+        # Aggregate: a cadence is usable if ANY detector reports it usable
+        combined_usable = np.zeros(len(ds.time), dtype=bool)
+        for qv in q_vars:
+            combined_usable |= is_usable(ds[qv].values.astype(np.uint8))
+        total = len(ds.time)
+        n_usable = int(combined_usable.sum())
+        summary["usable_fraction"] = round(n_usable / total, 4) if total else 0.0
+    else:
+        summary["usable_fraction"] = 0.0
+
+    # ── Gap list (durations in seconds, sorted descending) ──
+    from .gaps import find_gaps, gap_summary
+    if q_vars:
+        time_s = np.arange(len(ds.time), dtype=float) * cadence_s
+        gaps = find_gaps(combined_usable, time_s)
+        gap_durations = sorted([int(g[2]) for g in gaps], reverse=True)
+    else:
+        gap_durations = []
+    summary["gap_seconds"] = gap_durations
+
+    # ── SDD1 offline: quality var for SDD1 detector has zero usable cadences ──
+    sdd1_q_vars = [v for v in q_vars if "sdd1" in v.lower()]
+    if sdd1_q_vars:
+        sdd1_usable = int(is_usable(ds[sdd1_q_vars[0]].values.astype(np.uint8)).sum())
+        summary["sdd1_offline"] = sdd1_usable == 0
+    else:
+        # SDD1 had no data files at all this day
+        summary["sdd1_offline"] = True
+
+    # ── Quiet day flag ──
+    # Use Band A (1.5–3 keV) — the primary flare channel for SoLEXS
+    band_a_vars = [v for v in ds.data_vars if v.endswith("_band_A")]
+    summary["quiet_day"] = True
+    summary["peak_flux_ratio"] = 0.0
+    if band_a_vars:
+        band_a = ds[band_a_vars[0]].values.astype(float)
+        valid = band_a[~np.isnan(band_a)]
+        if len(valid) > 10:
+            day_median = float(np.median(valid))
+            day_max    = float(np.max(valid))
+            ratio = (day_max / day_median) if day_median > 0 else 0.0
+            summary["peak_flux_ratio"] = round(ratio, 2)
+            # 5× conservative threshold; C-class flares typically > 10×
+            summary["quiet_day"] = ratio < 5.0
+
+    return summary
 
 
 # ---------------------------------------------------------------------------

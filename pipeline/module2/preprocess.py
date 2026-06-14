@@ -146,12 +146,45 @@ def preprocess_day(
         if verbose:
             logger.info("Preprocessing detector prefix: %s", prefix)
 
-        # ── Collect band arrays ──
+        # ── Quality mask: NaN out cadences that are outside GTI or otherwise bad ──
+        #
+        # WHY HERE (before smoothing, not after features):
+        #   The SG filter interpolates over NaN spans when smoothing.
+        #   If we mask bad cadences here, the filter sees a gap where the
+        #   spike was and interpolates cleanly from its neighbours.
+        #   If we masked only after features, the spike would already have
+        #   been smoothed into neighbouring cadences and contaminated the
+        #   background / derivative estimates.
+        #
+        # IMPORTANT — flag semantics:
+        #   quality == 0 does NOT mean "clean".  In our bitmask, quality = 0
+        #   means IN_GTI bit is unset, which makes the cadence NOT usable.
+        #   Always call is_usable() rather than comparing to a literal.
+        from pipeline.module1.quality import is_usable as _is_usable
+        q_var   = f"{prefix}_quality"
+        if q_var in ds.data_vars:
+            q_arr   = ds[q_var].values.astype(np.uint8)
+            good    = _is_usable(q_arr)           # (n_times,) bool
+            n_bad   = int((~good).sum())
+            if verbose:
+                logger.info(
+                    "%s: masking %d / %d bad-quality cadences before smoothing "
+                    "(%.1f%% excluded)",
+                    prefix, n_bad, n_times, 100.0 * n_bad / max(n_times, 1),
+                )
+        else:
+            good = np.ones(n_times, dtype=bool)   # no quality var → trust all
+            if verbose:
+                logger.warning("%s: no quality variable found; treating all cadences as good", prefix)
+
+        # ── Collect band arrays (bad cadences → NaN before smoothing) ──
         raw_bands: dict = {}
         for b in bands:
             var = f"{prefix}_band_{b}"
             if var in ds.data_vars:
-                raw_bands[b] = ds[var].values.astype(float)
+                arr = ds[var].values.astype(float)
+                arr[~good] = np.nan    # mask in-place on the copy
+                raw_bands[b] = arr
 
         if not raw_bands:
             continue

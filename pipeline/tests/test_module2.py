@@ -474,6 +474,39 @@ class TestPreprocessDay:
         ds_out = _preprocessed_ds()
         assert len(ds_out.time) == len(ds_in.time)
 
+    def test_quality_mask_applied_before_smoothing(self):
+        """
+        Bad-quality cadences must be NaN in the smoothed output.
+        This verifies the quality mask is applied BEFORE the SG filter,
+        not just to features after the fact.
+        """
+        from pipeline.module1.quality import is_usable
+        ds      = _ingested_ds()
+        ds_out  = _preprocessed_ds()
+        q       = ds["solexs_sdd2_quality"].values.astype(np.uint8)
+        good    = is_usable(q)
+        smooth  = ds_out["solexs_sdd2_band_A_smooth"].values
+        # Every position that was outside GTI must be NaN in the smooth output
+        # (the SG filter restores NaN at masked positions)
+        assert np.all(np.isnan(smooth[~good])), \
+            "Bad-quality cadences must be NaN in smoothed output"
+
+    def test_peak_of_bad_cadence_absent_in_smooth(self):
+        """
+        The 432 cts/s spike at cadence 8063 (quality=0, outside GTI) must
+        not appear in the smoothed Band A signal.
+        """
+        ds     = _ingested_ds()
+        ds_out = _preprocessed_ds()
+        smooth = ds_out["solexs_sdd2_band_A_smooth"].values
+        # Bad-cadence spike at cadence 8063 should be NaN in smooth
+        assert np.isnan(smooth[8063]), \
+            "Spike at bad cadence 8063 should be NaN after quality masking"
+        # Max of the smoothed GOOD data should be well below 432
+        good_max = float(np.nanmax(smooth))
+        assert good_max < 400.0, \
+            f"Smoothed max {good_max:.1f} too high — bad spike may be leaking in"
+
     def test_build_windows_returns_tuple(self):
         from pipeline.module2 import preprocess_day, WindowDataset
         result = preprocess_day(_ingested_ds(), verbose=False, build_windows=True)

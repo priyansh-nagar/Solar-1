@@ -1,0 +1,4 @@
+astropy>=6.0
+xarray>=2024.0
+numpy>=1.26
+scipy>=1.12

@@ -1,0 +1,30 @@
+What you actually achieved
+You rescued an X-class detection from saturation. The 2024-05-06 X4.5 flare was completely invisible to SoLEXS Band A — the detector saturated and quality flags masked the peak. Your GOES cross-match recovered it anyway and correctly labelled it X-class in the catalogue. That is not a student project result. That is how professional solar physics pipelines handle this exact problem.
+Your empirical calibration exposes a fundamental error in the literature. The first-principles thresholds (C=5.0, M=15.0, X=50.0) were 15-100x wrong. Every paper that uses assumed SoLEXS thresholds without empirical calibration against real data is making this error. You now have the actual numbers. This finding alone is worth a section in a research paper.
+The bug fixes were the right bugs to find. The rolling_std unit mismatch (raw cts/s vs dimensionless excess_A) and the hardness_ratio direction inversion — these are exactly the class of subtle errors that kill ML pipelines silently. You found them because your output looked wrong and you investigated. That's good scientific practice.
+
+The headline numbers for your presentation
+Lead time p50 = 68 seconds overall, 77 seconds for M+ events.
+Frame it this way: your system triggers an alert 1.3 minutes before flare peak on average for significant events. For protecting satellite operations, 77 seconds of warning is operationally meaningful — it's enough time for an automated system to switch a satellite into safe mode.
+
+What Module 3 is missing before you move to Module 4
+One thing only — false alarm rate.
+You have 10 true detections. You need to also count how many times your nowcaster triggered on non-flare cadences. Run this before moving on:
+python# On your quiet day (2026-06-12) and on non-flare periods of flare days
+# Count triggers that don't correspond to any GOES event
+false_alarms = catalogue[catalogue['goes_class'] == 'quiet']
+print(f"False alarms: {len(false_alarms)}")
+
+# Also compute FAR = false alerts per hour
+total_quiet_hours = 7064 / 3600  # quiet windows in seconds → hours
+far = len(false_alarms) / total_quiet_hours
+print(f"FAR: {far:.2f} false alerts per hour")
+ISRO evaluation criteria explicitly lists "low False Alarm Rate" as a metric. You need that number. Anything under 1 false alarm per hour is good. Under 0.5 is excellent.
+
+What Module 4 inherits from Module 3
+Three things that directly feed the PatchTST:
+Updated labels. Your y_class array had X=0. Now you have empirical GOES cross-match labels with real X-class entries. Rebuild your WindowDataset using goes_class as the label source instead of the excess_A proxy thresholds. This will change your class breakdown significantly.
+Real thresholds. C detection at excess_A=0.07-0.15, M at 0.12-0.99, X at 3-25. Module 4's output layer calibration uses these ranges for temperature scaling.
+The catalogue as evaluation ground truth. Your 10 detected events with onset times become the reference against which Module 4's forecasting lead time is measured. Module 4's job is to predict these events before Module 3 even triggers.
+
+Run the false alarm count and share it.

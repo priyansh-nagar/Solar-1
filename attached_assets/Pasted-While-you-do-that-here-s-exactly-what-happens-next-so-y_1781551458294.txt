@@ -1,0 +1,61 @@
+While you do that, here's exactly what happens next so you know the full picture:
+
+After downloads — run this single script
+Once all 5 folders are in /tmp/solexs_data/, run this to process everything in one shot:
+pythonimport numpy as np
+from pathlib import Path
+from pipeline.module1 import ingest_day
+from pipeline.module2.preprocess import preprocess_day
+from pipeline.module2.windows import build_windows
+
+DATA_DIR = Path("/tmp/solexs_data/")
+
+all_X, all_y_binary, all_y_class = [], [], []
+
+for day_folder in sorted(DATA_DIR.iterdir()):
+    if not day_folder.is_dir():
+        continue
+    print(f"Processing {day_folder.name}...")
+    try:
+        ds  = ingest_day(solexs_dir=str(day_folder))
+        pds = preprocess_day(ds)
+        w   = build_windows(pds)
+        all_X.append(w["X"])
+        all_y_binary.append(w["y_binary"])
+        all_y_class.append(w["y_class"])
+        flare_count = w["y_binary"].sum()
+        total = len(w["y_binary"])
+        print(f"  → {total} windows, {flare_count} flares ({100*flare_count/total:.1f}%)")
+    except Exception as e:
+        print(f"  ✗ Failed: {e}")
+
+X       = np.concatenate(all_X).astype("float32")
+y_bin   = np.concatenate(all_y_binary)
+y_cls   = np.concatenate(all_y_class)
+
+print("\n=== FINAL DATASET ===")
+print(f"Total windows  : {len(y_bin)}")
+print(f"Flare windows  : {y_bin.sum()} ({100*y_bin.mean():.1f}%)")
+print(f"Quiet windows  : {(y_bin==0).sum()} ({100*(1-y_bin.mean()):.1f}%)")
+print(f"Imbalance ratio: {(y_bin==0).sum()/max(y_bin.sum(),1):.1f}x")
+print(f"Class breakdown: {np.bincount(y_cls.astype(int))}")
+print(f"X tensor shape : {X.shape}")
+
+# Save for Module 3 + 4
+np.save("/tmp/X_all.npy", X)
+np.save("/tmp/y_binary_all.npy", y_bin)
+np.save("/tmp/y_class_all.npy", y_cls)
+print("\nSaved to /tmp/")
+
+What to share after it runs
+Just paste these 6 numbers:
+Total windows  : ???
+Flare windows  : ??? (??%)
+Quiet windows  : ??? (??%)
+Imbalance ratio: ???x
+Class breakdown: [B=? C=? M=? X=?]
+X tensor shape : (?, 1800, 29)
+Those numbers directly determine three things in Module 3 and 4:
+NumberWhat it setsImbalance ratioFocal loss α in Module 4Class breakdownWhether Module 3 needs separate M/X thresholdsTotal windowsWhether we need data augmentation before training
+
+Go get those files. Come back with the 6 numbers

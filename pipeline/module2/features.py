@@ -234,9 +234,12 @@ def _rate_of_rise_fast(
     has_data = acnts >= min_data
 
     # Mean of positive derivatives; 0.0 if none are positive in the window
+    # Guard denominator to avoid divide-by-zero warning (np.where evaluates
+    # both branches before selecting — replace zeros with 1 in the divisor).
+    safe_pcnts = np.where(pcnts > 0, pcnts, 1.0)
     out = np.where(
         has_data,
-        np.where(pcnts > 0, sums / pcnts, 0.0),
+        np.where(pcnts > 0, sums / safe_pcnts, 0.0),
         np.nan,
     )
     return out.astype(np.float64)

@@ -15,25 +15,40 @@ Design decisions
     examples for rare flare classes.
 
   Label strategy
-    Binary and GOES-class labels derived from the normalised excess (excess_A)
-    in the label horizon.  Cross-match against the GOES XRS catalog in
-    Module 3 to replace with authoritative labels.
+    TWO modes controlled by label_source:
+
+    label_source="excess_A"  (default, backward-compatible)
+      Binary and class labels derived from peak excess_A in the label
+      horizon.  Uses first-principles GOES thresholds.  Kept for
+      compatibility with Module 2 tests only.  DO NOT use for Module 4.
+
+    label_source="goes_class"  ← USE THIS FOR MODULE 4
+      Labels derived from the per-cadence goes_class integer array
+      added by module3.goes_crossmatch.build_goes_labels().
+      For each window, the label = max(goes_class[horizon]) i.e. the
+      highest GOES class in the 30 min after the window ends.
+      y_binary = int(max_class >= 2)  (C-class and above = flare)
+      This is the ONLY correct labelling: the excess_A proxy had X=0
+      (detector saturated) and used wrong threshold values (C=5.0 vs
+      empirical C=0.15).
 
   Class balancing
-    Flares are rare (≫100:1 ratio).  Imbalance ratio is reported per split.
+    Flares are rare (>100:1 ratio).  Imbalance ratio is reported per split.
     Optional oversampling of flare windows in the training partition only.
     VAL and TEST are NEVER resampled — that would inflate reported metrics.
 
   Leakage prevention
     Windows spanning two split partitions are excluded.
     Windows with > max_nan_frac NaN values are excluded.
+    goes_class is stripped from the feature matrix F — it is a label,
+    not an input feature.  Including it would be data leakage.
 """
 
 from __future__ import annotations
 
 from collections import deque
 from dataclasses import dataclass, field
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, Literal, Optional, Tuple
 
 import numpy as np
 
@@ -45,7 +60,15 @@ STRIDE_S         = 60
 LABEL_HORIZON_S  = 1800
 FLARE_EXCESS_THRESHOLD = 5.0
 MAX_NAN_FRAC     = 0.30
+
+# First-principles GOES thresholds for excess_A mode (LEGACY — do not use for Module 4)
 GOES_THRESHOLDS  = {"B": 1.0, "C": 5.0, "M": 15.0, "X": 50.0}
+
+# GOES class integer for binary label boundary: C-class and above = flare
+GOES_FLARE_CLASS_MIN = 2   # C-class
+
+# Feature columns to strip before building F (they are labels, not inputs)
+_LABEL_COLS = frozenset({"goes_class"})
 
 
 @dataclass
@@ -60,6 +83,7 @@ class WindowDataset:
     cadence_s     : float = 1.0
     window_s      : int   = WINDOW_S
     label_horizon_s: int  = LABEL_HORIZON_S
+    label_source  : str   = "excess_A"
     imbalance_ratio: Dict[str, float] = field(default_factory=dict)
 
     def get_partition(
@@ -87,11 +111,27 @@ class WindowDataset:
 
         return X_p, yb_p, yc_p
 
+    def class_breakdown(self) -> dict:
+        """Return per-class window counts and fractions for each split."""
+        cls_names = {0: "A", 1: "B", 2: "C", 3: "M", 4: "X"}
+        result = {}
+        for part, name in [(TRAIN, "train"), (VAL, "val"), (TEST, "test")]:
+            mask = self.splits == part
+            yc = self.y_class[mask]
+            counts = {}
+            for i in range(5):
+                n = int((yc == i).sum())
+                if n > 0:
+                    counts[cls_names[i]] = n
+            result[name] = counts
+        return result
+
 
 def build_windows(
     features: Dict[str, np.ndarray],
     split_array: np.ndarray,
     excess_A: Optional[np.ndarray] = None,
+    label_source: Literal["excess_A", "goes_class"] = "excess_A",
     window_s: int          = WINDOW_S,
     stride_s: int          = STRIDE_S,
     label_horizon_s: int   = LABEL_HORIZON_S,
@@ -105,21 +145,31 @@ def build_windows(
     Parameters
     ----------
     features        : {feature_name: (n_times,) array}
+                      Must contain "goes_class" if label_source="goes_class".
+                      "goes_class" is automatically stripped from the feature
+                      matrix — it is a label, not an input.
     split_array     : (n_times,) uint8 from split.build_split_array()
-    excess_A        : (n_times,) normalised excess (label signal)
+    excess_A        : (n_times,) normalised excess — used only when
+                      label_source="excess_A"
+    label_source    : "excess_A" (legacy) or "goes_class" (correct for Mod 4)
     window_s        : window length in seconds
     stride_s        : stride between windows in seconds
     label_horizon_s : look-ahead horizon in seconds
-    flare_threshold : excess threshold → binary flare label
+    flare_threshold : excess threshold → binary flare label (excess_A mode only)
     max_nan_frac    : reject windows with more NaN than this fraction
     cadence_s       : seconds per sample
     """
+    if label_source not in ("excess_A", "goes_class"):
+        raise ValueError(
+            f"label_source must be 'excess_A' or 'goes_class', got {label_source!r}"
+        )
+
     window_len  = int(window_s  / cadence_s)
     stride      = max(1, int(stride_s / cadence_s))
     horizon_len = int(label_horizon_s / cadence_s)
 
-    feature_names = sorted(features.keys())
-    n_features    = len(feature_names)
+    # Strip label columns before building the feature matrix
+    feature_names = sorted(k for k in features.keys() if k not in _LABEL_COLS)
     n_times       = len(split_array)
 
     # Feature matrix (n_times, n_features) in float32
@@ -127,20 +177,29 @@ def build_windows(
         [features[f].astype(np.float32) for f in feature_names], axis=1
     )
 
-    # Label signal
-    if excess_A is None:
-        excess_A = features.get("excess_A", np.zeros(n_times, dtype=float))
-    excess_A = np.asarray(excess_A, dtype=float)
+    # ── Label signal ──────────────────────────────────────────────────────
+    if label_source == "goes_class":
+        _label_array, _label_fn = _setup_goes_class_labels(features, n_times)
+    else:
+        # Legacy excess_A mode
+        if excess_A is None:
+            excess_A = features.get("excess_A", np.zeros(n_times, dtype=float))
+        excess_A = np.asarray(excess_A, dtype=float)
+        _label_array = excess_A
+        _label_fn = None
 
-    # Precompute forward maximum excess for labelling (O(n) deque algorithm)
-    max_future = _rolling_max_future_deque(excess_A, horizon_len)
+    # Precompute forward maximum label for each position (O(n) deque)
+    # For goes_class: max future class in [-1,4]; treat -1 as 0
+    if label_source == "goes_class":
+        # Replace -1 (unknown) with 0 (A-class background) for the horizon max
+        gc_clean = np.where(_label_array < 0, 0, _label_array).astype(float)
+        max_future = _rolling_max_future_deque(gc_clean, horizon_len)
+    else:
+        max_future = _rolling_max_future_deque(_label_array, horizon_len)
 
-    # Precompute per-cadence split and NaN info for fast window rejection
-    # NaN fraction per window: sum NaN indicator over window / window_len
-    F_isnan = np.isnan(F)  # (n_times, n_features)
-    nan_indicator = F_isnan.mean(axis=1).astype(np.float32)  # (n_times,)
-
-    # Prefix sum of NaN indicator for O(1) window NaN query
+    # NaN fraction per window: prefix-sum approach for O(1) per window
+    F_isnan = np.isnan(F)
+    nan_indicator = F_isnan.mean(axis=1).astype(np.float32)
     cs_nan = np.concatenate([[0.0], np.cumsum(nan_indicator)])
 
     X_list:  List[np.ndarray] = []
@@ -159,33 +218,36 @@ def build_windows(
     for start in range(0, max_start, stride):
         end = start + window_len
 
-        # ── Split check: window must lie within one non-GAP partition ──
-        # Use mode: find majority non-GAP split in the window
+        # ── Split check ───────────────────────────────────────────────────
         window_splits = split_array[start:end]
-        # Fast check using unique values
-        uniq = np.unique(window_splits)
+        uniq    = np.unique(window_splits)
         non_gap = uniq[uniq != GAP]
         if len(non_gap) != 1:
             continue
         partition = int(non_gap[0])
 
-        # ── NaN fraction check (O(1) using prefix sums) ──
+        # ── NaN fraction check ───────────────────────────────────────────
         window_nan_frac = (cs_nan[end] - cs_nan[start]) / window_len
         if window_nan_frac > max_nan_frac:
             continue
 
-        # ── Label: peak excess in the horizon after this window ──
-        # max_future[end-1] = max(excess_A[end-1 : end-1+horizon_len])
-        # but we precomputed max_future[i] = max(excess_A[i : i+horizon_len])
-        # so we want max_future[end] not end-1 (the label horizon AFTER the window)
+        # ── Label: peak in the horizon after this window ──────────────────
         label_idx = min(end, n_times - 1)
-        peak = float(max_future[label_idx]) if label_idx + horizon_len <= n_times else np.nan
+        peak = (
+            float(max_future[label_idx])
+            if label_idx + horizon_len <= n_times
+            else np.nan
+        )
 
         if np.isnan(peak):
             continue
 
-        y_binary = int(peak >= flare_threshold)
-        y_class  = _goes_class_label(peak)
+        if label_source == "goes_class":
+            y_class  = int(peak)                          # already an int class
+            y_binary = int(y_class >= GOES_FLARE_CLASS_MIN)
+        else:
+            y_binary = int(peak >= flare_threshold)
+            y_class  = _goes_class_label(peak)
 
         X_list.append(F[start:end].copy())
         yb_list.append(y_binary)
@@ -216,8 +278,36 @@ def build_windows(
         cadence_s       = cadence_s,
         window_s        = window_s,
         label_horizon_s = label_horizon_s,
+        label_source    = label_source,
         imbalance_ratio = _compute_imbalance(yb_arr, sp_arr),
     )
+
+
+# ---------------------------------------------------------------------------
+# goes_class label setup helper
+# ---------------------------------------------------------------------------
+
+def _setup_goes_class_labels(
+    features: Dict[str, np.ndarray],
+    n_times: int,
+) -> tuple:
+    """
+    Validate and extract the goes_class array from features.
+
+    Returns (goes_class_array, None).  Raises if goes_class is missing.
+    """
+    if "goes_class" not in features:
+        raise KeyError(
+            "label_source='goes_class' requires 'goes_class' in features dict. "
+            "Call module3.goes_crossmatch.build_goes_labels(pds, date) first "
+            "to add per-cadence GOES labels to the Dataset."
+        )
+    gc = np.asarray(features["goes_class"], dtype=np.int8)
+    if len(gc) != n_times:
+        raise ValueError(
+            f"goes_class length {len(gc)} != n_times {n_times}"
+        )
+    return gc, None
 
 
 # ---------------------------------------------------------------------------
@@ -255,6 +345,7 @@ def _rolling_max_future_deque(arr: np.ndarray, horizon: int) -> np.ndarray:
 
 
 def _goes_class_label(peak_excess: float) -> int:
+    """Map peak excess_A to GOES class integer (excess_A mode only)."""
     if peak_excess >= GOES_THRESHOLDS["X"]: return 4
     if peak_excess >= GOES_THRESHOLDS["M"]: return 3
     if peak_excess >= GOES_THRESHOLDS["C"]: return 2

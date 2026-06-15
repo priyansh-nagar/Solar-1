@@ -40,10 +40,14 @@ Replace first-principles thresholds in windows.py before Module 4 training.
 - FAR gate: < 1.0 FA/hr to proceed to Module 4
 - ±120-s buffer around GOES flare windows prevents penalising early-rise triggers as FA
 
-## Module 4 inputs
-- X_all.npy: (7459, 1800, 29) @ /tmp/
-- y_binary_all.npy, y_class_all.npy @ /tmp/
-- focal_loss: γ=2.0, α=0.80; imbalance 17.9×
-- Catalogue ground truth: /tmp/module3_catalogue.csv
+## Module 4 inputs — v2 dataset (GOES labels, correct)
+- /tmp/X_v2.npy, y_binary_v2.npy, y_class_v2.npy (rebuilt with goes_class labels)
+- label_source="goes_class" in build_windows() — goes_class auto-stripped from F matrix
+- build_goes_labels() in pipeline/module3/goes_crossmatch.py adds goes_class to Dataset
+- Fallback: empirical excess_A thresholds (C≥0.15, M≥0.99, X≥3.00) when GOES offline
+- NEVER use first-principles thresholds (C=5.0, M=15.0, X=50.0) — those are 15-100x wrong
+- focal_loss: γ=2.0, α=0.80; imbalance 17.9× (real data estimate)
+- Patch size: 30 s → 60 patches per window (patch_size=30, num_patches=60) — LOCKED
+- h5py required for GOES NetCDF download (now installed)
 - StandardScaler must be fit on TRAIN partition only
-- REBUILD WindowDataset labels from goes_class (not excess_A proxy) before Module 4
+- Catalogue ground truth: /tmp/module3_catalogue.csv

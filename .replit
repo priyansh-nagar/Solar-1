@@ -29,4 +29,4 @@ externalPort = 80
 
 [nix]
 channel = "stable-25_05"
-packages = ["glibcLocales", "libxcrypt", "pkg-config", "xsimd"]
+packages = ["glibcLocales", "hdf5", "libxcrypt", "openssh", "pkg-config", "xsimd"]

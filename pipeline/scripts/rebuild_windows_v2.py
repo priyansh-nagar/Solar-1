@@ -11,8 +11,25 @@ This script:
   2. Adds per-cadence GOES labels via build_goes_labels() (downloads NOAA NGDC
      data, or falls back to empirical excess_A thresholds if offline)
   3. Rebuilds sliding windows with label_source="goes_class"
-  4. Saves X_v2.npy / y_binary_v2.npy / y_class_v2.npy to /tmp/
-  5. Prints the new class breakdown — X must no longer be 0
+  4. Applies DAY-LEVEL split assignment (not within-day 70/15/15)
+  5. Recasts y_binary as M+ (y_class >= 3) — C+ threshold was degenerate
+     (98.4% positive on these peak Solar Cycle 25 days)
+  6. Saves X_v2.npy / y_binary_v2.npy / y_class_v2.npy / splits_v2.npy
+  7. Prints per-partition class breakdown
+
+DAY-LEVEL SPLIT RATIONALE
+--------------------------
+The original within-day 70/15/15 split put X-class events into TRAIN only
+(all X events happened early UTC, falling in the first 70% of each day).
+VAL and TEST had 0 X-class windows — the model could not be evaluated on
+extreme events.
+
+Day-level assignment fixes this:
+  TRAIN: 2024-02-22 (X6.4), 2024-10-03 (M9), 2024-05-06 (X2.7), 2026-06-12
+  VAL:   2024-05-10  (active, but contained — no X-class)
+  TEST:  2024-02-09  (X3.4 — model sees X-class at evaluation time)
+
+No 30-minute leakage gap is required between days (days are weeks apart).
 
 HOW TO RUN
 ----------
@@ -61,21 +78,28 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 from pipeline.module1            import ingest_day
 from pipeline.module2.preprocess import preprocess_day
 from pipeline.module2.windows    import build_windows, WINDOW_S, STRIDE_S, LABEL_HORIZON_S
+from pipeline.module2.split      import TRAIN, VAL, TEST
 from pipeline.module3.goes_crossmatch import build_goes_labels
 
 
 # ---------------------------------------------------------------------------
-# Real-data day configs — edit paths when running on real PRADAN data
+# Real-data day configs and DAY-LEVEL split assignment
 # ---------------------------------------------------------------------------
+
 REAL_DAY_CONFIGS = [
-    # (path, date_for_GOES_download or None)
-    ("AL1_SLX_L1_20240209_v1.0", datetime(2024,  2,  9)),
-    ("AL1_SLX_L1_20240222_v1.0", datetime(2024,  2, 22)),
-    ("AL1_SLX_L1_20240506_v1.0", datetime(2024,  5,  6)),
-    ("AL1_SLX_L1_20240510_v1.0", datetime(2024,  5, 10)),
-    ("AL1_SLX_L1_20241003_v1.0", datetime(2024, 10,  3)),
-    ("AL1_SLX_L1_20260612_v1.0", None),    # quiet day — no GOES needed
+    # (folder_name, date_for_GOES_download_or_None, day_split_partition)
+    ("AL1_SLX_L1_20240209_v1.0", datetime(2024,  2,  9), TEST),   # X3.4 — held-out test
+    ("AL1_SLX_L1_20240222_v1.0", datetime(2024,  2, 22), TRAIN),  # X6.4 — strongest signal
+    ("AL1_SLX_L1_20240506_v1.0", datetime(2024,  5,  6), TRAIN),  # X2.7
+    ("AL1_SLX_L1_20240510_v1.0", datetime(2024,  5, 10), VAL),    # moderate — validation
+    ("AL1_SLX_L1_20241003_v1.0", datetime(2024, 10,  3), TRAIN),  # M9 — second strongest
+    ("AL1_SLX_L1_20260612_v1.0", None,                   TRAIN),  # quiet — negative examples
 ]
+
+# M+ binary threshold: only M-class and above trigger a "flare alert"
+# C+ was degenerate (98.4% positive) because GOES background in Solar Cycle 25
+# peak stays at C-level even during inter-flare periods on these active days.
+BINARY_MIN_CLASS = 3   # 0=A, 1=B, 2=C, 3=M, 4=X  → M+ = flare
 
 
 # ---------------------------------------------------------------------------
@@ -86,14 +110,21 @@ def process_day(
     day_dir: Path,
     date: datetime | None,
     label: str,
+    assigned_split: int,
 ) -> dict | None:
     """
     Run Modules 1+2 → GOES labels → build_windows(label_source='goes_class').
 
-    Returns dict with X, y_binary, y_class arrays plus stats, or None on failure.
+    Parameters
+    ----------
+    assigned_split : TRAIN / VAL / TEST constant — ALL windows from this day
+                     are assigned to this partition (day-level split).
+
+    Returns dict with X, y_binary, y_class, splits arrays plus stats, or None.
     """
     t0 = time.perf_counter()
-    print(f"  {label} …", end=" ", flush=True)
+    split_name = {TRAIN: "TRAIN", VAL: "VAL", TEST: "TEST"}.get(assigned_split, "?")
+    print(f"  {label} [{split_name}] …", end=" ", flush=True)
 
     # ── Module 1 ─────────────────────────────────────────────────────────
     try:
@@ -122,8 +153,7 @@ def process_day(
         print(f"✗ goes_labels: {exc}")
         return None
 
-    # ── Extract feature dict from Dataset ─────────────────────────────────
-    # Include goes_class as a feature so build_windows can strip & use it as label
+    # ── Feature dict ──────────────────────────────────────────────────────
     prefix = "solexs_sdd2"
     feat_dict = {}
     for var in ds_pp.data_vars:
@@ -132,13 +162,14 @@ def process_day(
         if "spectrum" in var:
             continue
         if var == "goes_class":
-            # Include goes_class so windows.py can use it as label source
             feat_dict["goes_class"] = ds_pp["goes_class"].values.astype(float)
             continue
         if var.startswith(prefix) and "quality" not in var:
             key = var.removeprefix(f"{prefix}_")
             feat_dict[key] = ds_pp[var].values.astype(float)
 
+    # Use the within-day split_array only to exclude GAP cadences from windows.
+    # We will override window split assignments below.
     split_arr = ds_pp["split"].values
 
     # ── Build windows ─────────────────────────────────────────────────────
@@ -146,7 +177,7 @@ def process_day(
         wd = build_windows(
             features        = feat_dict,
             split_array     = split_arr,
-            label_source    = "goes_class",   # THE KEY CHANGE
+            label_source    = "goes_class",
             window_s        = WINDOW_S,
             stride_s        = STRIDE_S,
             label_horizon_s = LABEL_HORIZON_S,
@@ -156,28 +187,43 @@ def process_day(
         print(f"✗ build_windows: {exc}")
         return None
 
+    # ── DAY-LEVEL SPLIT OVERRIDE ──────────────────────────────────────────
+    # Replace the within-day split assignments with the day's designated partition.
+    # All windows from this day → assigned_split.  No gap needed between days
+    # (days are weeks to months apart — no temporal continuity).
+    day_splits = np.full(len(wd.splits), assigned_split, dtype=np.uint8)
+
+    # ── M+ binary labels ──────────────────────────────────────────────────
+    # Recast y_binary as M+ (y_class >= BINARY_MIN_CLASS).
+    # The original C+ threshold (y_class >= 2) was degenerate on these days.
+    y_binary_mp = (wd.y_class >= BINARY_MIN_CLASS).astype(np.int8)
+
     elapsed = time.perf_counter() - t0
-    n_flare = int(wd.y_binary.sum())
-    n_total = len(wd.y_binary)
+    cls_names = ["A", "B", "C", "M", "X"]
+    n_total = len(wd.y_class)
+    n_mp    = int(y_binary_mp.sum())
     cls_counts = {
-        cls: int((wd.y_class == i).sum())
-        for i, cls in enumerate(["A", "B", "C", "M", "X"])
+        c: int((wd.y_class == i).sum())
+        for i, c in enumerate(cls_names)
         if int((wd.y_class == i).sum()) > 0
     }
+    imb = (n_total - n_mp) / max(n_mp, 1)
 
     print(
-        f"✓  {n_total} windows  flare%={100*n_flare/max(n_total,1):.1f}%  "
-        f"classes={cls_counts}  source={source}  [{elapsed:.1f}s]"
+        f"✓  {n_total} windows  M+%={100*n_mp/max(n_total,1):.1f}%  "
+        f"imbal={imb:.1f}×  classes={cls_counts}  [{elapsed:.1f}s]"
     )
 
     return {
         "X":        wd.X,
-        "y_binary": wd.y_binary,
+        "y_binary": y_binary_mp,
         "y_class":  wd.y_class,
+        "splits":   day_splits,
         "n_total":  n_total,
-        "n_flare":  n_flare,
+        "n_mp":     n_mp,
         "label":    label,
         "source":   source,
+        "assigned_split": assigned_split,
     }
 
 
@@ -198,17 +244,17 @@ def run_synthetic() -> None:
     with tempfile.TemporaryDirectory() as tmp:
         tmp = Path(tmp)
 
-        # Two flare days + one quiet day
         configs = [
-            (make_day(tmp, "20240222", n_hours=4, seed=42), datetime(2024, 2, 22), "2024-02-22 (X+M+C)"),
-            (make_day(tmp, "20240506", n_hours=4, seed=99), datetime(2024, 5,  6), "2024-05-06 (M+C)"),
-            (_make_quiet_day(tmp, "20260612"),               None,                  "2026-06-12 (quiet)"),
+            (make_day(tmp, "20240209", n_hours=4, seed=11), datetime(2024, 2,  9), "2024-02-09", TEST),
+            (make_day(tmp, "20240222", n_hours=4, seed=42), datetime(2024, 2, 22), "2024-02-22", TRAIN),
+            (make_day(tmp, "20240506", n_hours=4, seed=99), datetime(2024, 5,  6), "2024-05-06", TRAIN),
+            (_make_quiet_day(tmp, "20260612"),               None,                  "2026-06-12", TRAIN),
         ]
 
         print("Processing days:")
         results = []
-        for day_dir, date, label in configs:
-            r = process_day(day_dir, date, label)
+        for day_dir, date, label, sp in configs:
+            r = process_day(day_dir, date, label, sp)
             if r is not None:
                 results.append(r)
 
@@ -244,15 +290,20 @@ def run_real(data_dir: Path) -> None:
     print(f"  REAL DATA MODE — {data_dir}")
     print("=" * 65)
     print()
+    print("  Day-level split assignment:")
+    split_labels = {TRAIN: "TRAIN", VAL: "VAL", TEST: "TEST"}
+    for folder_name, date, sp in REAL_DAY_CONFIGS:
+        print(f"    {folder_name.split('_')[3]}  →  {split_labels[sp]}")
+    print()
 
     results = []
-    for folder_name, date in REAL_DAY_CONFIGS:
+    for folder_name, date, assigned_split in REAL_DAY_CONFIGS:
         day_dir = data_dir / folder_name
         if not day_dir.exists():
             print(f"  {folder_name}: directory not found — skipping")
             continue
-        label = folder_name.split("_")[3]   # extract YYYYMMDD
-        r = process_day(day_dir, date, label)
+        label = folder_name.split("_")[3]
+        r = process_day(day_dir, date, label, assigned_split)
         if r is not None:
             results.append(r)
 
@@ -268,14 +319,12 @@ def _finish(results: list) -> None:
         print("\n  ✗ No days processed successfully.")
         sys.exit(1)
 
-    X_all       = np.concatenate([r["X"]        for r in results], axis=0).astype(np.float32)
-    y_binary    = np.concatenate([r["y_binary"]  for r in results], axis=0)
-    y_class     = np.concatenate([r["y_class"]   for r in results], axis=0)
+    X_all    = np.concatenate([r["X"]        for r in results], axis=0).astype(np.float32)
+    y_binary = np.concatenate([r["y_binary"] for r in results], axis=0)
+    y_class  = np.concatenate([r["y_class"]  for r in results], axis=0)
+    splits   = np.concatenate([r["splits"]   for r in results], axis=0)
 
     n_total = len(X_all)
-    n_flare = int(y_binary.sum())
-
-    # Per-class counts
     cls_names = ["A", "B", "C", "M", "X"]
     counts    = [int((y_class == i).sum()) for i in range(5)]
 
@@ -283,64 +332,128 @@ def _finish(results: list) -> None:
     print("=" * 65)
     print("  NEW DATASET (v2) — CLASS BREAKDOWN")
     print("=" * 65)
-    print(f"  Total windows : {n_total:,}")
-    print(f"  Feature shape : {X_all.shape}")
+    print(f"  Total windows : {n_total:,}  shape={X_all.shape}")
     print()
     print(f"  {'Class':<6} {'Windows':>10} {'%':>8}")
-    print("  " + "─" * 28)
+    print("  " + "─" * 30)
     for cls, cnt in zip(cls_names, counts):
         bar = "█" * int(20 * cnt / max(n_total, 1))
         print(f"  {cls:<6} {cnt:>10,} {100*cnt/max(n_total,1):>7.2f}%  {bar}")
-    print("  " + "─" * 28)
+    print("  " + "─" * 30)
     print(f"  {'Total':<6} {n_total:>10,}  100.00%")
-    print()
 
-    flare_pct = 100 * n_flare / max(n_total, 1)
-    imbalance = (n_total - n_flare) / max(n_flare, 1)
-    print(f"  Flare windows (C+) : {n_flare:,}  ({flare_pct:.2f}%)")
-    print(f"  Imbalance ratio    : {imbalance:.1f}× (quiet/flare)")
-    print()
-
-    # Key check: X-class must not be 0
     x_count = counts[4]
     if x_count > 0:
-        print(f"  ✓ X-class correctly labelled: {x_count} windows (was 0 in v1)")
+        print(f"\n  ✓ X-class correctly labelled: {x_count} windows (was 0 in v1)")
     else:
-        print("  ⚠ X-class = 0.  Check GOES cross-match or flare data availability.")
+        print("\n  ⚠ X-class = 0. Check GOES cross-match or data availability.")
+
+    # ── Per-partition breakdown ───────────────────────────────────────────
+    print()
+    print("=" * 65)
+    print("  PARTITION BREAKDOWN  (M+ binary = y_class >= M)")
+    print("=" * 65)
+    print(f"  {'Part':<8} {'Total':>6}  {'A':>5} {'B':>5} {'C':>5} {'M':>5} {'X':>5}  {'M+%':>6}  {'Imbal':>6}")
+    print("  " + "─" * 63)
+
+    part_stats = {}
+    for part, pname in [(TRAIN, "TRAIN"), (VAL, "VAL"), (TEST, "TEST")]:
+        mask = splits == part
+        yc = y_class[mask]
+        tot = len(yc)
+        if tot == 0:
+            continue
+        pc = [int((yc == i).sum()) for i in range(5)]
+        mp = pc[3] + pc[4]
+        nm = tot - mp
+        imb = nm / max(mp, 1)
+        mp_pct = 100 * mp / max(tot, 1)
+        xcls = pc[4]
+        print(
+            f"  {pname:<8} {tot:>6}  "
+            + "  ".join(f"{c:>5}" for c in pc)
+            + f"  {mp_pct:>5.1f}%  {imb:>5.2f}×"
+        )
+        part_stats[pname] = {
+            "n": tot, "M+": mp, "X": xcls,
+            "M+_pct": round(mp_pct, 2), "imbalance": round(imb, 2),
+        }
+    print("  " + "─" * 63)
+
+    # Key checks
+    print()
+    tr = part_stats.get("TRAIN", {})
+    te = part_stats.get("TEST", {})
+    if te.get("X", 0) > 0:
+        print(f"  ✓ TEST has {te['X']} X-class windows (was 0 in within-day split)")
+    else:
+        print("  ⚠ TEST has 0 X-class windows")
+    if tr.get("X", 0) > 0:
+        print(f"  ✓ TRAIN has {tr['X']} X-class windows (strongest events in training)")
 
     # ── Save ─────────────────────────────────────────────────────────────
     out_dir = Path("/tmp")
     np.save(out_dir / "X_v2.npy",        X_all)
     np.save(out_dir / "y_binary_v2.npy", y_binary)
     np.save(out_dir / "y_class_v2.npy",  y_class)
+    np.save(out_dir / "splits_v2.npy",   splits)
+
+    # Focal loss parameters for M+ binary and multiclass
+    tr_mp  = tr.get("M+", 1)
+    tr_tot = tr.get("n", 1)
+    tr_nm  = tr_tot - tr_mp
+    tr_imb = tr_nm / max(tr_mp, 1)
+
+    # Effective Number of Samples per class (Lin et al. β=0.9999)
+    beta = 0.9999
+    ens = [((1 - beta**max(c, 1)) / (1 - beta)) for c in counts]
+    alpha_ens = [1.0 / max(e, 1e-9) for e in ens]
+    alpha_sum = sum(alpha_ens)
+    alpha_norm = [round(a / alpha_sum * len(cls_names), 4) for a in alpha_ens]
 
     stats = {
-        "n_total":       n_total,
-        "shape":         list(X_all.shape),
-        "n_flare":       n_flare,
-        "flare_pct":     round(flare_pct, 4),
-        "imbalance":     round(imbalance, 2),
-        "class_counts":  dict(zip(cls_names, counts)),
-        "label_source":  "goes_class",
-        "patch_size_s":  30,
-        "n_patches":     WINDOW_S // 30,
+        "n_total":        n_total,
+        "shape":          list(X_all.shape),
+        "class_counts":   dict(zip(cls_names, counts)),
+        "label_source":   "goes_class",
+        "binary_def":     "M+ (y_class >= 3)",
+        "split_strategy": "day-level",
+        "partitions":     part_stats,
+        "focal_loss": {
+            "binary_M+": {
+                "train_imbalance": round(tr_imb, 2),
+                "gamma":  1.0,
+                "alpha":  round(tr_nm / max(tr_tot, 1), 3),
+                "note": "barely imbalanced; class_weight preferred over focal",
+            },
+            "multiclass_alpha_ENS": dict(zip(cls_names, alpha_norm)),
+        },
+        "patch_size_s":   30,
+        "n_patches":      WINDOW_S // 30,
     }
 
     with open(out_dir / "dataset_v2_stats.json", "w") as f:
         json.dump(stats, f, indent=2)
 
+    print()
     print(f"  Saved:")
-    print(f"    /tmp/X_v2.npy           {X_all.nbytes / 1e6:.1f} MB  shape={X_all.shape}")
-    print(f"    /tmp/y_binary_v2.npy    {y_binary.nbytes / 1e3:.1f} KB")
+    print(f"    /tmp/X_v2.npy           {X_all.nbytes / 1e6:.0f} MB  shape={X_all.shape}")
+    print(f"    /tmp/y_binary_v2.npy    {y_binary.nbytes / 1e3:.1f} KB   (M+ binary)")
     print(f"    /tmp/y_class_v2.npy     {y_class.nbytes / 1e3:.1f} KB")
+    print(f"    /tmp/splits_v2.npy      {splits.nbytes / 1e3:.1f} KB   (0=TRAIN 1=VAL 2=TEST)")
     print(f"    /tmp/dataset_v2_stats.json")
+
     print()
     print("  ── MODULE 4 HANDOFF ─────────────────────────────────────")
     print(f"  X shape        : {X_all.shape}  (windows × time × features)")
-    print(f"  Imbalance      : {imbalance:.1f}×  → focal_loss γ=2.0 α=0.80")
+    print(f"  y_binary def   : M+  (y_class >= 3, M or X)")
+    print(f"  TRAIN imbalance: {tr_imb:.2f}×  → class_weight={{0:{tr_imb:.2f}, 1:1.0}}")
+    print(f"  focal_loss     : γ=1.0, α={round(tr_nm/max(tr_tot,1), 3)} (M+ head)")
+    print(f"  Multiclass α   : {dict(zip(cls_names, alpha_norm))}  (ENS)")
     print(f"  Patch size     : 30 s → 60 patches per window (defended)")
-    print(f"  Label source   : goes_class (GOES cross-match + empirical fallback)")
+    print(f"  Label source   : goes_class (GOES NGDC NetCDF + empirical fallback)")
     print(f"  StandardScaler : fit on TRAIN partition only")
+    print(f"  Split strategy : day-level  (no within-day leakage gap needed)")
     print("  ─────────────────────────────────────────────────────────")
     print()
 
@@ -351,7 +464,7 @@ def _finish(results: list) -> None:
 
 def main() -> None:
     parser = argparse.ArgumentParser(
-        description="Rebuild WindowDataset with GOES labels (Module 4 prep)"
+        description="Rebuild WindowDataset with GOES labels and day-level splits"
     )
     parser.add_argument("--data-dir", default="/tmp/solexs_data")
     parser.add_argument(

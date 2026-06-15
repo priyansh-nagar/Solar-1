@@ -40,16 +40,18 @@ Replace first-principles thresholds in windows.py before Module 4 training.
 - FAR gate: < 1.0 FA/hr to proceed to Module 4
 - ±120-s buffer around GOES flare windows prevents penalising early-rise triggers as FA
 
-## Module 4 inputs — v2 dataset (REAL DATA, GOES labels)
-- /tmp/X_v2.npy shape=(7470,1800,29), y_binary_v2.npy, y_class_v2.npy
-- GOES source: ngdc_netcdf for 5 active days; excess_A_fallback for 20260612 (future date)
-- Class breakdown: A=119(1.6%), B=2(0.03%), C=4723(63.2%), M=2311(30.9%), X=315(4.2%)
-- DATASET BIAS: all 6 days are peak Solar Cycle 25 — GOES background stays at C-level
-  → C+ binary is useless (98.4% positive). Use M+ as the binary "flare" definition.
-- Binary thresholds:
-    C+: imbalance 0.02× (degenerate — do NOT use)
-    M+: imbalance 1.84× → focal loss not needed; use class_weight={0:1, 1:1.84}
-    X:  imbalance 22.7× → γ=2.0, α=0.958
-- Multiclass focal α: A=0.984, B=1.00, C=0.368, M=0.691, X=0.958
-- Patch size: 30 s → 60 patches per window (patch_size=30, num_patches=60) — LOCKED
-- h5py installed; StandardScaler must be fit on TRAIN partition only
+## Module 4 inputs — v2 dataset FINAL (real data, day-level splits)
+- Files: /tmp/X_v2.npy (7470,1800,29), y_binary_v2.npy, y_class_v2.npy, splits_v2.npy
+- GOES source: ngdc_netcdf (5 days); excess_A_fallback (20260612 — future date)
+- Class totals: A=119, B=2, C=4723, M=2311, X=315
+- y_binary = M+ (y_class >= 3) — C+ was degenerate (98.4% pos on these SC25 peak days)
+- SPLIT STRATEGY: day-level (whole days assigned, not within-day 70/15/15)
+    TRAIN: 20240222(X6.4) + 20241003(M9) + 20240506(X2.7) + 20260612(quiet) → 4885 windows
+    VAL:   20240510 → 1381 windows  (60.9% M+ — heavily active, VAL metrics will be optimistic)
+    TEST:  20240209 → 1204 windows  (19.3% M+, 67 X-class ✓ — was 0 in within-day split)
+- FOCAL LOSS FINAL:
+    M+ binary: TRAIN imbalance=2.15×; use class_weight={0:2.15,1:1.0} (focal not needed)
+               if focal: γ=1.0, α=0.682
+    Multiclass: inverse-freq weights: C=1.58, M=3.23, X=23.7 (merge A+B into background)
+- Patch size: 30 s → 60 patches per window — LOCKED
+- h5py installed; StandardScaler fit on TRAIN partition only

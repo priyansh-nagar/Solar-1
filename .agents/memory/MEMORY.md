@@ -1,0 +1,2 @@
+- [SoLEXS pipeline architecture](solexs-pipeline.md) — Modules 1-3 complete; key calibration bugs found and fixed
+- [Module 3 detector design](module3-detector.md) — Two-channel voter: excess_A + band_C (NOT hardness_ratio); adaptive CFAR thresholds on signal itself

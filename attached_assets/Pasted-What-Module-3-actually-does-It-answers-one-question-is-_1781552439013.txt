@@ -1,0 +1,36 @@
+What Module 3 actually does
+It answers one question: is a flare happening right now?
+That's nowcasting. Not prediction, not forecasting — just real-time detection the moment a flare begins. Module 4 will do the forecasting (predicting before it happens). Keep these two jobs completely separate in your head.
+Module 3 has three distinct jobs inside it:
+Job 1 — GOES cross-match: Your SoLEXS data alone can't tell you what GOES class a flare is, because SoLEXS saturates on bright events and its Band A energy range doesn't map cleanly to the standard GOES classification. So you download GOES-16 XRS 1-minute data for the same days and align it to your SoLEXS time grid. This gives every cadence a real GOES class label — including the X-class events that SoLEXS saturation hid.
+Job 2 — Empirical threshold calibration: Before you can detect anything, you need to know what excess_A actually reads during B, C, M, and X class flares on SoLEXS specifically. Your current thresholds were guessed from first principles. After the GOES cross-match you compute the real median and 95th percentile of excess_A per GOES class. Those numbers become your detection thresholds. Never use assumed thresholds — always derive them from the data.
+Job 3 — Multi-channel adaptive detection: The actual nowcaster. It triggers when excess_A rises above a dynamic threshold AND hardness_ratio shifts simultaneously. Both must agree. One channel alone causes too many false positives.
+
+Critical mistakes to avoid
+Mistake 1 — Fixed thresholds.
+
+A fixed threshold like "excess_A > 5.0 means flare" will fail badly. Solar background varies across the day, across the solar cycle, and between quiet and active periods. Your threshold must scale with rolling_std_5min — when the background is noisier, the bar rises automatically. This is the single most important design decision in the nowcaster.
+Mistake 2 — Single channel detection.
+
+Detecting on excess_A alone gives you cosmic ray hits, detector glitches, and satellite maneuvers as false flares. Real flares appear in both soft AND hard X-ray simultaneously with a physically consistent rise profile. hardness_ratio must shift at the same time as excess_A spikes. If only one moves, reject it.
+Mistake 3 — Trusting SoLEXS for X-class labels.
+
+You already discovered this — the X4.5 day gave zero flare windows because saturation masked the peak. Never use excess_A thresholds alone to label X-class events. Always use GOES cross-match as the ground truth for labels. SoLEXS is your detection instrument; GOES is your labelling authority.
+Mistake 4 — Not enforcing minimum gap between events.
+
+On active days like 2024-02-22 (X6.4 with multiple M-class precursors), flares follow each other closely. Without a minimum separation rule, the tail of one flare bleeds into the onset of the next and you detect the same event multiple times. Enforce at minimum a 5-minute gap between distinct detections.
+Mistake 5 — Counting saturated cadences as missed detections.
+
+When the detector saturates, quality flags mark those cadences as bad. If you evaluate your nowcaster's recall on saturated cadences you'll get artificially low scores. Filter these out before computing TPR and FAR. Your evaluation must only run on GTI-valid cadences.
+Mistake 6 — Spike rejection too aggressive or too loose.
+
+Very short spikes (1-3 seconds) are almost always cosmic rays or electronics noise, not flares. Real flare onsets sustain for at least 30 seconds. But if you require too long a sustain window you'll miss the onset time and your reported lead time in Module 4 evaluation will look worse than it is. 30 seconds sustain is the right balance.
+
+One number that matters most for judges
+Lead time — how many seconds before the flare peak did Module 3 first trigger?
+Every other metric (TPR, FAR, precision) is secondary to this in the evaluation criteria. When you build the catalogue output, store onset time AND peak time for every event. The difference between them is your lead time. On X-class flares this should be 3-8 minutes if your threshold is calibrated right. That number is what you headline in your presentation.
+
+What the output looks like
+Module 3 produces a flare catalogue — a clean table where every row is one detected event with: onset time, peak time, duration, peak excess_A, GOES class (from cross-match), and detection confidence. This catalogue becomes the ground truth that Module 4's forecasting model is evaluated against.
+
+Start with the GOES cross-match and empirical mapping first. Don't write the detection logic until you know what the real excess_A values look like per GOES class — those numbers determine everything else.

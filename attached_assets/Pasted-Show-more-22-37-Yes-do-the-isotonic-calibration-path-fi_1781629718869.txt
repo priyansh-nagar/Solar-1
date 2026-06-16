@@ -1,0 +1,59 @@
+Show more
+22:37
+Yes — do the isotonic calibration path first. It's already built and it directly addresses the threshold mismatch. No new data needed.
+
+Run it now:
+
+bash
+python pipeline/scripts/evaluate_calibrated_leadtime.py \
+    --ckpt-dir /tmp/module4_ckpt_v3 \
+    --data-dir /tmp \
+    --calibrator /tmp/module4_ckpt_v3/isotonic_calibrator.pkl
+If that script doesn't exist yet, add this function to evaluate.py and call it:
+
+python
+def calibrated_lead_time(model, calibrator, X_test, 
+                          y_test, splits, far_budget=0.5):
+    """
+    Re-run lead time computation using isotonic-calibrated 
+    probabilities instead of raw model output.
+    The calibrator shifts the operating threshold down to where
+    the pre-onset signal actually lives (~0.40-0.44).
+    """
+    import pickle
+    import numpy as np
+
+    with open(calibrator, "rb") as f:
+        iso = pickle.load(f)
+
+    # Get raw probs on TEST
+    raw_probs   = get_test_probs(model, X_test)  # your existing function
+    cal_probs   = iso.predict(raw_probs)
+
+    # Recompute FAR threshold on calibrated probs using VAL set
+    X_val       = X_test  # replace with actual VAL split
+    # ... find threshold where FAR = far_budget on VAL
+    # Then apply to TEST lead time computation
+
+    lead_times  = compute_lead_times(cal_probs, y_test, 
+                                      threshold=new_threshold)
+    print(f"Calibrated lead time median: {np.median(lead_times):.1f} min")
+    print(f"Calibrated FAR threshold   : {new_threshold:.4f}")
+    return lead_times
+What to look for in the output
+Three numbers matter:
+
+New FAR threshold — should drop from 0.782 to somewhere around 0.35-0.50 after calibration. If it drops below 0.44, the pre-onset signal (p=0.37-0.44) becomes detectable.
+
+Measurable events — should go from 0/1 to 1/1. The C→M transition at idx=721 with 30 windows of elevated probability should now cross threshold.
+
+Lead time — if threshold drops below 0.44, you get ~30 minutes of lead time on that event. That would make your combined system (Module 3 + Module 4) lead time approximately 30 minutes + 77 seconds = ~32 minutes total.
+
+If calibrated lead time still shows 0
+Then the isotonic calibrator is overfit to VAL (ECE=0.000 on VAL confirmed this). In that case we accept lead time as a known limitation and frame it honestly in the presentation:
+
+"The model detects pre-onset elevated probability (p=0.44) on the TEST day but the operating threshold calibrated on VAL is too conservative for this event. This is a known train/test prior mismatch — TEST M+ rate is 22% vs TRAIN 36%. Additional diverse training days would resolve this."
+
+That honest framing is actually stronger than hiding the limitation. ISRO judges respect self-awareness about model limitations far more than overclaimed results. You have TPR=0.721, X-recall=0.856, ECE=0.097 — those three numbers are genuinely strong. Lead time being a known open problem is a research finding, not a failure.
+
+Run the calibrated evaluation and share the output.

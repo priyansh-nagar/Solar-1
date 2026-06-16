@@ -1,0 +1,43 @@
+{
+  "val": {
+    "partition": "VAL",
+    "n_windows": 1381,
+    "obs_hours": 23.0,
+    "prevalence_mplus": 0.715,
+    "far_budget": 0.5,
+    "tpr_at_far0.5": 0.689,
+    "roc_auc_30min": 0.875,
+    "ece_30min": 0.137,
+    "ece_extreme": 0.689,
+    "x_recall": 0.965,
+    "lead_median_min": 30.0,
+    "lead_mean_min": 23.0,
+    "n_flare_events_detected": 3,
+    "n_onsets_total": 7,
+    "n_onsets_skipped_boundary": 1,
+    "far_op_threshold": 0.795,
+    "opt_threshold": 0.72,
+    "min_threshold_for_lead": 0.7672
+  },
+  "test": {
+    "partition": "TEST",
+    "n_windows": 1204,
+    "obs_hours": 20.1,
+    "prevalence_mplus": 0.218,
+    "far_budget": 0.5,
+    "tpr_at_far0.5": 0.721,
+    "roc_auc_30min": 0.86,
+    "ece_30min": 0.288,
+    "ece_extreme": 0.675,
+    "x_recall": 0.856,
+    "lead_median_min": 0.0,
+    "lead_mean_min": 0.0,
+    "n_flare_events_detected": 0,
+    "n_onsets_total": 2,
+    "n_onsets_skipped_boundary": 1,
+    "far_op_threshold": 0.782,
+    "opt_threshold": 0.793,
+    "min_threshold_for_lead": 0.4435
+  },
+  "test_ece_calibrated": 0.0975
+}

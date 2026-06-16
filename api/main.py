@@ -25,11 +25,9 @@ from pydantic import BaseModel, Field
 # Path setup — works both locally and on Render
 # ---------------------------------------------------------------------------
 ROOT = Path(__file__).resolve().parent.parent
-sys.path.insert(0, str(ROOT))
-
 CKPT_DIR = ROOT / "pipeline" / "checkpoints"
 
-from pipeline.module4.model import SolarPatchTST
+from api.solexs_model import SolarPatchTST
 
 # ---------------------------------------------------------------------------
 # App setup

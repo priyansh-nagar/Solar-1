@@ -1,0 +1,82 @@
+What you need to do right now — in order
+
+Run on real data immediately (today)
+python pipeline/scripts/rebuild_windows_v2.py --data-dir /tmp/solexs_data
+python pipeline/scripts/train_module4.py --data-dir /tmp --ckpt-dir /tmp/module4_ckpt
+Share those five headline numbers when training finishes. Everything else depends on them.
+What good results look like vs bad
+MetricBadAcceptableGoodExcellentTPR@FAR0.5<0.400.40-0.600.60-0.75>0.75Lead time (min)<22-55-10>10X-class recall00.30-0.500.50-0.70>0.70ECE after calibration>0.150.10-0.150.05-0.10<0.05Best epoch1-3 (underfit)20-30 (converged)10-20 (clean)8-15 (fast)
+If any number is in the "bad" column, tell me which one and I'll tell you exactly why and what to change.
+If training crashes
+Most likely causes in order:
+NaN loss at epoch 1 → learning rate too high, add gradient clipping: torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+CUDA out of memory → reduce batch size from 32 to 16
+VAL loss immediately worse than TRAIN → your StandardScaler was fit on wrong partition, re-check
+Loss doesn't decrease at all → class weights applied incorrectly, the model is predicting base rate
+you need 5 files
+What each file is
+FileWhat it containsSize estimateX_v2.npyYour 7,470 windows of shape (1800,29)~1.2 GBy_binary_v2.npyM+ binary labels (0/1) for each window<1 MBy_class_v2.npyGOES class labels (0-4) for each window<1 MBsplits_v2.npy0=TRAIN, 1=VAL, 2=TEST per window<1 MBy_15min_v2.npyM+ label with 15-minute horizon<1 MBy_60min_v2.npyM+ label with 60-minute horizon<1 MBy_extreme_v2.npyX-only binary label for extreme head<1 MBfeature_names_v2.jsonNames of all 29 features in ordertiny
+The only large file is X_v2.npy. Everything else is negligible.
+You already have most of this
+From your Module 2 + 3 work you already generated X_v2.npy, y_binary_v2.npy, y_class_v2.npy, and splits_v2.npy. They're sitting in /tmp/ from the rebuild you ran earlier.
+The three new files — y_15min, y_60min, y_extreme — are just derived from y_class_v2.npy with different horizon offsets. The rebuild script generates all of them in one shot.
+
+One command generates everything
+bashpython pipeline/scripts/rebuild_windows_v2.py
+--data-dir /tmp/solexs_data
+--out-dir /tmp
+--horizons 15 30 60
+--extreme-head
+This takes 10-20 minutes to run. When it finishes /tmp/ will have all 8 files and you run training immediately after.
+yes i have 5 day folders from PRADAN
+
+16:11
+Run this right now:
+
+bash
+python pipeline/scripts/rebuild_windows_v2.py
+--data-dir /tmp/solexs_data
+--out-dir /tmp
+--horizons 15 30 60
+--extreme-head
+That's it. One command. Let it run — it'll take 10-20 minutes.
+
+While it runs, check that your 5 folders are named correctly:
+
+bash
+ls /tmp/solexs_data/
+You should see exactly:
+
+AL1_SLX_L1_20240209_v1.0
+AL1_SLX_L1_20240222_v1.0
+AL1_SLX_L1_20240506_v1.0
+AL1_SLX_L1_20240510_v1.0
+AL1_SLX_L1_20241003_v1.0
+If any folder name is slightly different — wrong date, missing v1.0, extra characters — the ingest script won't find it and will silently skip that day. That would corrupt your dataset without an obvious error.
+uploading the 5 files
+If it crashes
+"FileNotFoundError: X_v2.npy not found" → the --out-dir path is wrong, change /tmp to wherever you want output
+"ModuleNotFoundError" → you're running from the wrong directory, cd to your pipeline/ root first
+"MemoryError" → Replit is running out of RAM on the 1.2GB X array. Add --dtype float16 flag if your rebuild script supports it, or move to Colab for this step
+Runs fine but outputs 0 windows → FITS files aren't being found inside the folders, check that .fits or .lc files exist one level inside each day folder
+After downloading — three commands
+Step 1 — Add to your data directory:
+bashcp -r AL1_SLX_L1_20240328_v1.0 /tmp/solexs_data/
+Step 2 — Rebuild dataset:
+bashpython pipeline/scripts/rebuild_windows_v2.py
+--data-dir /tmp/solexs_data
+--out-dir /tmp
+--horizons 15 30 60
+--extreme-head
+Step 3 — Retrain v3:
+bashpython pipeline/scripts/train_module4.py
+--data-dir /tmp
+--ckpt-dir /tmp/module4_ckpt_v3
+--horizon 60
+--label-smoothing 0.1
+--calibration isotonic
+
+What to expect from v3
+The 2024-03-28 X1.1 day goes into TRAIN (your split assigns the first 4 days chronologically to TRAIN). This gives the model a template for slow-rise X-class precursors. Lead time on TEST should move from 0.0 to somewhere between 4-12 minutes.
+TPR will likely recover slightly too — more diverse training examples generally help generalisation across all metrics.
+Share the five numbers after v3 finishes. also uploading fits file for 1 more day- a moderate X1-X2 or strong M-class event that's not 2024-02-09 That single additional day is what breaks the lead-time deadlock.

@@ -53,4 +53,4 @@ externalPort = 80
 
 [nix]
 channel = "stable-25_05"
-packages = ["cairo", "ffmpeg-full", "freetype", "ghostscript", "glibcLocales", "gobject-introspection", "gtk3", "hdf5", "libxcrypt", "openssh", "pkg-config", "qhull", "tcl", "tk", "xsimd"]
+packages = ["cairo", "curl", "ffmpeg-full", "freetype", "ghostscript", "glibcLocales", "gobject-introspection", "gtk3", "hdf5", "libjpeg", "libxcrypt", "netcdf", "openssh", "pkg-config", "qhull", "tcl", "tk", "xsimd", "zlib"]

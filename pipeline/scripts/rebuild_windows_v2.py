@@ -90,6 +90,7 @@ REAL_DAY_CONFIGS = [
     # (folder_name, date_for_GOES_download_or_None, day_split_partition)
     ("AL1_SLX_L1_20240209_v1.0", datetime(2024,  2,  9), TEST),   # X3.4 — held-out test
     ("AL1_SLX_L1_20240222_v1.0", datetime(2024,  2, 22), TRAIN),  # X6.4 — strongest signal
+    ("AL1_SLX_L1_20240323_v1.0", datetime(2024,  3, 23), TRAIN),  # X1.1 — new day (breaks lead-time deadlock)
     ("AL1_SLX_L1_20240506_v1.0", datetime(2024,  5,  6), TRAIN),  # X2.7
     ("AL1_SLX_L1_20240510_v1.0", datetime(2024,  5, 10), VAL),    # moderate — validation
     ("AL1_SLX_L1_20241003_v1.0", datetime(2024, 10,  3), TRAIN),  # M9 — second strongest

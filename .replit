@@ -11,6 +11,26 @@ env = { "CI" = "true" }
 [workflows]
 runButton = "Project"
 
+[[workflows.workflow]]
+name = "Project"
+mode = "parallel"
+author = "agent"
+
+[[workflows.workflow.tasks]]
+task = "workflow.run"
+args = "Train Module 4"
+
+[[workflows.workflow]]
+name = "Train Module 4"
+author = "agent"
+
+[[workflows.workflow.tasks]]
+task = "shell.exec"
+args = "cd /home/runner/workspace && python pipeline/scripts/train_module4.py --data-dir /tmp --ckpt-dir /tmp/module4_ckpt --no-shap --d-model 32 --n-layers 1 --batch 64 --epochs 30"
+
+[workflows.workflow.metadata]
+outputType = "console"
+
 [agent]
 stack = "PNPM_WORKSPACE"
 expertMode = true

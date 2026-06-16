@@ -109,22 +109,27 @@ class SolarFlareDataset(Dataset):
 
     Parameters
     ----------
-    x_path       : path to X_v2.npy (read via mmap during init)
-    indices      : 1-D array of global row indices for this partition
-    y_binary_30  : (N_total,) int8 — M+ at 30 min
-    y_class      : (N_total,) int8 — GOES class 0–4
-    scaler       : fitted StandardScaler
-    feature_names: list of 29 feature names in column order
-    y_binary_15  : optional (N_total,) int8 — M+ at 15 min
-    y_binary_60  : optional (N_total,) int8 — M+ at 60 min
-    y_extreme    : optional (N_total,) int8 — X-class at 30 min
-    verbose      : print loading progress
+    x_path        : path to X_v2.npy (read via mmap during init).
+                    Pass None only when *_preloaded_X* is provided.
+    indices       : 1-D array of global row indices for this partition.
+                    Pass None only when *_preloaded_X* is provided.
+    y_binary_30   : (N_total,) int8 — M+ at 30 min
+    y_class       : (N_total,) int8 — GOES class 0–4
+    scaler        : fitted StandardScaler
+    feature_names : list of 29 feature names in column order
+    y_binary_15   : optional (N_total,) int8 — M+ at 15 min
+    y_binary_60   : optional (N_total,) int8 — M+ at 60 min
+    y_extreme     : optional (N_total,) int8 — X-class at 30 min
+    verbose       : print loading progress
+    _preloaded_X  : (N, T, F) float32 torch.Tensor — skip disk loading entirely.
+                    Used for unit tests and synthetic-data runs where no .npy file exists.
+                    When provided, x_path and indices are ignored.
     """
 
     def __init__(
         self,
-        x_path:        Path,
-        indices:       np.ndarray,
+        x_path:        Optional[Path],
+        indices:       Optional[np.ndarray],
         y_binary_30:   np.ndarray,
         y_class:       np.ndarray,
         scaler:        StandardScaler,
@@ -133,6 +138,7 @@ class SolarFlareDataset(Dataset):
         y_binary_60:   Optional[np.ndarray] = None,
         y_extreme:     Optional[np.ndarray] = None,
         verbose:       bool = True,
+        _preloaded_X:  Optional[torch.Tensor] = None,
     ):
         self.feature_names = feature_names
         self.soft_idx, self.hard_idx = resolve_stream_indices(feature_names)
@@ -141,13 +147,23 @@ class SolarFlareDataset(Dataset):
         mean = scaler.mean_.astype(np.float32)
         std  = np.sqrt(scaler.var_).clip(1e-8).astype(np.float32)
 
-        # ── Bulk-load X into RAM ─────────────────────────────────────────
-        n_mb = len(indices) * 1800 * 29 * 4 // (1024 ** 2)
-        if verbose:
-            print(f"    Loading {len(indices)} windows ({n_mb} MB) …", end=" ", flush=True)
-        self.X = _load_partition_x(x_path, indices, mean, std)   # (N, 1800, 29)
-        if verbose:
-            print("OK")
+        # ── Bulk-load X into RAM (or use preloaded tensor for tests) ─────
+        if _preloaded_X is not None:
+            # Unit test / synthetic path: X is already in memory, already scaled.
+            self.X = _preloaded_X.float()
+            N = len(self.X)
+            indices = np.arange(N)
+        else:
+            if x_path is None or indices is None:
+                raise ValueError(
+                    "Either x_path + indices must be provided, or _preloaded_X must be set."
+                )
+            n_mb = len(indices) * 1800 * 29 * 4 // (1024 ** 2)
+            if verbose:
+                print(f"    Loading {len(indices)} windows ({n_mb} MB) …", end=" ", flush=True)
+            self.X = _load_partition_x(x_path, indices, mean, std)   # (N, 1800, 29)
+            if verbose:
+                print("OK")
 
         # ── Labels (small — plain in-memory tensors) ─────────────────────
         y15  = y_binary_15[indices] if y_binary_15 is not None else y_binary_30[indices]

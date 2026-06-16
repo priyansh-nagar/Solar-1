@@ -98,7 +98,11 @@ class StreamEncoder(nn.Module):
             batch_first=True,
             norm_first=True,    # pre-norm — more stable on small datasets
         )
-        self.encoder = nn.TransformerEncoder(layer, num_layers=n_layers)
+        # enable_nested_tensor is incompatible with norm_first=True; disable explicitly
+        # to suppress PyTorch's UserWarning on every instantiation.
+        self.encoder = nn.TransformerEncoder(
+            layer, num_layers=n_layers, enable_nested_tensor=False
+        )
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         return self.encoder(x)   # (B, N_patches, d_model)

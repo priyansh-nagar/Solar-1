@@ -274,21 +274,25 @@ def evaluate_model(
 
     lead = compute_lead_times(p30, yc, threshold=opt_t, stride_s=stride_s)
 
+    def _f(v, n=3):
+        """Round and convert to Python float for JSON safety."""
+        return round(float(v), n)
+
     metrics = {
         "partition":          partition,
-        "n_windows":          n_windows,
-        "obs_hours":          round(obs_hours, 1),
-        "prevalence_mplus":   round(float(yb30.mean()), 3),
-        "far_budget":         far_thr,
-        f"tpr_at_far{far_thr}": round(tpr_val, 3),
-        "roc_auc_30min":      round(auc_val, 3),
-        "ece_30min":          round(ece_val, 3),
-        "ece_extreme":        round(ece_ext, 3),
-        "x_recall":           round(x_recall, 3) if not np.isnan(x_recall) else None,
-        "lead_median_min":    round(lead["lead_median_min"], 1),
-        "lead_mean_min":      round(lead["lead_mean_min"], 1),
-        "n_flare_events_detected": lead["n_detected"],
-        "opt_threshold":      round(opt_t, 3),
+        "n_windows":          int(n_windows),
+        "obs_hours":          _f(obs_hours, 1),
+        "prevalence_mplus":   _f(yb30.mean()),
+        "far_budget":         float(far_thr),
+        f"tpr_at_far{far_thr}": _f(tpr_val),
+        "roc_auc_30min":      _f(auc_val),
+        "ece_30min":          _f(ece_val),
+        "ece_extreme":        _f(ece_ext),
+        "x_recall":           _f(x_recall) if not np.isnan(x_recall) else None,
+        "lead_median_min":    _f(lead["lead_median_min"], 1),
+        "lead_mean_min":      _f(lead["lead_mean_min"], 1),
+        "n_flare_events_detected": int(lead["n_detected"]),
+        "opt_threshold":      _f(opt_t),
     }
 
     if verbose:

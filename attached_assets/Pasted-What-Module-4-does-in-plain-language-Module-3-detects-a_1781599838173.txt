@@ -1,0 +1,59 @@
+What Module 4 does in plain language
+Module 3 detects a flare after it starts. Module 4 sees the same 30-minute window and asks: "is there a precursor pattern here that suggests a flare is coming?" It fires before Module 3 triggers. The gap between Module 4's alert and Module 3's detection is your additional lead time — the headline number for ISRO judges.
+
+The full data flow
+Your input is one window: shape (1800, 29). That's 30 minutes of 29 features at 1-second cadence.
+Stage 1 — Split into instrument streams
+Your 29 features split physically into two groups:
+
+SoLEXS features: band_A, band_A_background, band_A_smooth, excess_A, residual_A, derivative_1s, derivative_60s, rate_of_rise, rolling_std_5min, rolling_std_15min, cumulative_excess, hardness_ratio, softness_ratio, total — roughly 15 features
+HEL1OS features: the remaining band_B/C/D variants — roughly 14 features
+
+These are separated before patching because they represent physically distinct instruments. The model should first learn what each instrument says independently, then learn how they relate to each other.
+Stage 2 — Patch embedding
+Each stream is divided into 60 non-overlapping patches of 30 timesteps. Each patch is projected to a d_model-dimensional vector via a linear layer. You now have two sequences of 60 vectors — one per instrument. Positional encodings are added so the model knows temporal order.
+Stage 3 — Within-stream self-attention
+Each instrument stream runs through its own Transformer encoder independently. SoLEXS patches attend to SoLEXS patches. HEL1OS patches attend to HEL1OS patches. This learns temporal patterns within each instrument — "soft X-ray rose slowly across patches 50-58 then accelerated in patch 59."
+Stage 4 — Cross-stream attention (the novel part)
+SoLEXS representations now attend to HEL1OS representations and vice versa. This is a cross-attention layer where query comes from one stream and key/value come from the other. The model learns joint signatures: "gradual soft X-ray rise in patches 55-59 combined with simultaneous hard X-ray uptick = precursor pattern." This cross-instrument fusion is what no existing published PatchTST implementation does on solar data.
+Stage 5 — Three parallel heads
+After fusion, the combined representation feeds three independent heads simultaneously:
+Binary M+ head: sigmoid output → P(M+ flare in next 15/30/60 min). Three neurons. Standard cross-entropy with class weight {0:2.15, 1:1.0}.
+Extreme event head: sigmoid output → P(X-class in next 30 min). One neuron. Focal loss γ=2.0, α=0.958 because 22.7x imbalance.
+Multiclass head: softmax over C/M/X → probability distribution over flare class. Weighted cross-entropy with w_C=1.58, w_M=3.23, w_X=23.7.
+Total output per window: 7 numbers. One forward pass.
+
+Hyperparameters and why
+d_model = 64. You have 7,470 windows. A large model (d_model=256) will overfit badly on this dataset size. 64 gives enough representational capacity without overfitting. If validation loss diverges from training loss after epoch 5, this is the first number to reduce.
+n_heads = 4. Each attention head learns a different relationship between patches. 4 heads at d_model=64 means each head operates on 16 dimensions — enough to be meaningful, not so many that they collapse to similar patterns.
+n_layers = 2. Two Transformer encoder layers per stream. More layers = more capacity = more overfitting risk on 7k windows. Start at 2. If validation metrics plateau early, add a third layer.
+dropout = 0.2. Applied after each attention layer and after the feedforward sublayer. Critical regularisation given your dataset size.
+Learning rate = 1e-4 with cosine annealing. Cosine annealing reduces the learning rate smoothly from 1e-4 to 1e-6 over training. This lets the model make large updates early and fine-tune carefully later. Flat learning rate on Transformer models causes instability.
+Batch size = 32. Small enough to fit in Colab memory with (32, 1800, 29) tensors, large enough for stable gradient estimates.
+Epochs = 30 with early stopping patience = 7. Stop training if validation TPR-at-0.5-FAR doesn't improve for 7 consecutive epochs. Save the best checkpoint, not the last one.
+
+The three mistakes that kill Module 4
+Mistake 1 — Wrong evaluation metric.
+
+Do not use accuracy or even standard F1. Your VAL set is 60.9% M+ — a model predicting "always flare" gets 60.9% accuracy and looks great. Your evaluation metric must be TPR at fixed FAR=0.5/hr. That means: at whatever threshold gives exactly 0.5 false alarms per hour, what fraction of real M+ events did you catch? This is how operational space weather systems are evaluated.
+Mistake 2 — Not separating the three heads' losses.
+
+Each head has a different loss function and different class weights. Compute three separate losses and sum them with weights: total_loss = 1.0 × binary_loss + 0.5 × extreme_loss + 0.3 × multiclass_loss. The binary M+ head is your primary task — it gets full weight. The others are auxiliary supervision that helps the shared backbone learn better representations.
+Mistake 3 — Evaluating lead time wrong.
+
+Lead time is not "how early in the window does probability cross 0.5." It's "how many minutes before Module 3's detected onset time does Module 4 first alert." You need to run Module 4 in sliding window mode on the raw time series — every minute, feed the last 30 minutes of data and get a probability. The first minute where probability crosses 0.5 before a known Module 3 onset is your lead time for that event. This is more complex to implement but it's the only honest measurement.
+
+Temperature scaling (post-training, 1 hour of work, high return)
+After training, your raw probabilities will be poorly calibrated — P=0.8 won't actually mean 80% of those windows are true flares. Temperature scaling fixes this in one step: learn a single scalar T on the validation set such that softmax(logits/T) gives calibrated probabilities. This is 20 lines of code and transforms your dashboard probability gauge from decorative to scientifically meaningful. Every serious ML system does this. Almost no hackathon team does. It will be noticed.
+
+SHAP (post-training, 2 hours of work, very high return for professors)
+After temperature scaling, run SHAP on 10-20 test windows. For each prediction, SHAP tells you which time patches and which features contributed most to the alert. You can visualise this as a heatmap on the light curve — "the model detected this precursor signature 8 minutes before the flare, primarily driven by rising excess_A in patches 52-57 and simultaneous band_C increase." That visualisation is what makes a professor want to continue this work. It turns a black-box model into a physically interpretable detector.
+
+What to share after training
+Five numbers:
+TPR at FAR=0.5/hr     (primary metric)
+Additional lead time   (minutes before Module 3 onset)
+X-class recall         (did the extreme head catch X events in TEST?)
+Calibration error      (before and after temperature scaling)
+Best epoch             (did it converge or overfit?)
+Those five numbers tell the complete story of whether Module 4 worked.

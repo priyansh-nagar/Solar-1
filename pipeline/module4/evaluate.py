@@ -174,6 +174,28 @@ def run_inference(
 # Lead time computation
 # ---------------------------------------------------------------------------
 
+def _far_operating_threshold(
+    probs:     np.ndarray,
+    y_true:    np.ndarray,
+    far_thr:   float,
+    obs_hours: float,
+) -> float:
+    """
+    Return the probability threshold at the FAR operating point.
+
+    This is the highest threshold before the number of false positives
+    first exceeds far_thr * obs_hours — i.e. the same cut used internally
+    by tpr_at_far().  Using this threshold for lead-time computation ensures
+    lead time is measured at the same operating point as TPR@FAR.
+    """
+    max_fp  = far_thr * obs_hours
+    order   = np.argsort(-probs)
+    cum_neg = np.cumsum(1 - y_true[order])
+    exceeds = np.where(cum_neg > max_fp)[0]
+    cut     = exceeds[0] - 1 if len(exceeds) > 0 else len(probs) - 1
+    return float(probs[order[max(cut, 0)]])
+
+
 def compute_lead_times(
     probs:      np.ndarray,
     y_class:    np.ndarray,
@@ -189,7 +211,15 @@ def compute_lead_times(
     'new flare' event is identified by finding runs of consecutive M+ windows.
     Lead time = (first alert index − onset index) × stride_s / 60 minutes.
 
-    Returns median and mean lead time in minutes.
+    Onsets at idx=0 are skipped: no preceding windows exist to search, so
+    lead time is undefined (the sequence starts already in M+ state).
+
+    Also returns ``min_threshold_for_lead`` — the lowest threshold at which
+    any onset produces a lead time > 0.  If this equals threshold, lead time
+    is non-zero.  If it is far below threshold, the model's pre-onset signal
+    exists but is too weak to cross the operating point.
+
+    Returns dict with median/mean lead time, event count, and diagnostics.
     """
     alerts = (probs >= threshold).astype(int)
     m_plus = (y_class >= 3).astype(int)
@@ -197,24 +227,53 @@ def compute_lead_times(
     # Find onset cadences: transition from 0 → 1 in y_class
     onsets = np.where(np.diff(m_plus, prepend=0) == 1)[0]
 
-    leads = []
+    leads          = []
+    skipped_boundary = 0
+
+    # Diagnostic: find the minimum threshold that yields any lead time
+    min_thr_for_lead: Optional[float] = None
+
     for onset in onsets:
-        # Search backward from onset for first alert in a preceding window
-        search_start = max(0, onset - window_s // stride_s)
+        # Skip onset at the very start of the sequence — no preceding windows
+        # exist, so lead time is undefined (not a model failure).
+        if onset == 0:
+            skipped_boundary += 1
+            continue
+
+        search_start  = max(0, onset - window_s // stride_s)
+        pre_probs     = probs[search_start:onset]
         window_alerts = alerts[search_start:onset]
+
         if window_alerts.sum() > 0:
-            first = search_start + np.argmax(window_alerts)
+            first    = search_start + np.argmax(window_alerts)
             lead_min = (onset - first) * stride_s / 60.0
             leads.append(lead_min)
+        else:
+            # Check what minimum threshold would give lead time for this onset
+            if len(pre_probs) > 0:
+                max_pre = float(pre_probs.max())
+                if max_pre > 0:
+                    if min_thr_for_lead is None or max_pre > min_thr_for_lead:
+                        min_thr_for_lead = max_pre
+
+    result: Dict[str, object] = {
+        "lead_median_min":       0.0,
+        "lead_mean_min":         0.0,
+        "n_detected":            0,
+        "n_onsets_total":        int(len(onsets)),
+        "n_onsets_skipped_boundary": int(skipped_boundary),
+    }
+
+    if min_thr_for_lead is not None:
+        result["min_threshold_for_lead"] = round(min_thr_for_lead, 4)
 
     if not leads:
-        return {"lead_median_min": 0.0, "lead_mean_min": 0.0, "n_detected": 0}
+        return result
 
-    return {
-        "lead_median_min": float(np.median(leads)),
-        "lead_mean_min":   float(np.mean(leads)),
-        "n_detected":      len(leads),
-    }
+    result["lead_median_min"] = float(np.median(leads))
+    result["lead_mean_min"]   = float(np.mean(leads))
+    result["n_detected"]      = len(leads)
+    return result
 
 
 # ---------------------------------------------------------------------------
@@ -268,37 +327,49 @@ def evaluate_model(
     except Exception:
         auc_val = float("nan")
 
-    # Optimal threshold for lead-time computation (maximise F1 on positive class)
+    # Operating threshold at FAR budget — used for both TPR and lead time.
+    # Using the FAR-based threshold (not F1-optimal) ensures lead time is
+    # measured at the same operating point as the headline TPR@FAR metric.
+    far_op_t = _far_operating_threshold(p30, yb30, far_thr=far_thr, obs_hours=obs_hours)
+
+    # F1-optimal threshold (kept for reference / opt_threshold field)
     try:
         from sklearn.metrics import precision_recall_curve
         prec, rec, thresh = precision_recall_curve(yb30, p30)
-        f1s    = 2 * prec * rec / np.maximum(prec + rec, 1e-6)
-        opt_t  = float(thresh[np.argmax(f1s[:-1])])
+        f1s   = 2 * prec * rec / np.maximum(prec + rec, 1e-6)
+        opt_t = float(thresh[np.argmax(f1s[:-1])])
     except Exception:
-        opt_t  = 0.5
+        opt_t = far_op_t
 
-    lead = compute_lead_times(p30, yc, threshold=opt_t, stride_s=stride_s)
+    lead = compute_lead_times(p30, yc, threshold=far_op_t, stride_s=stride_s)
 
     def _f(v, n=3):
         """Round and convert to Python float for JSON safety."""
         return round(float(v), n)
 
     metrics = {
-        "partition":          partition,
-        "n_windows":          int(n_windows),
-        "obs_hours":          _f(obs_hours, 1),
-        "prevalence_mplus":   _f(yb30.mean()),
-        "far_budget":         float(far_thr),
-        f"tpr_at_far{far_thr}": _f(tpr_val),
-        "roc_auc_30min":      _f(auc_val),
-        "ece_30min":          _f(ece_val),
-        "ece_extreme":        _f(ece_ext),
-        "x_recall":           _f(x_recall) if not np.isnan(x_recall) else None,
-        "lead_median_min":    _f(lead["lead_median_min"], 1),
-        "lead_mean_min":      _f(lead["lead_mean_min"], 1),
+        "partition":               partition,
+        "n_windows":               int(n_windows),
+        "obs_hours":               _f(obs_hours, 1),
+        "prevalence_mplus":        _f(yb30.mean()),
+        "far_budget":              float(far_thr),
+        f"tpr_at_far{far_thr}":    _f(tpr_val),
+        "roc_auc_30min":           _f(auc_val),
+        "ece_30min":               _f(ece_val),
+        "ece_extreme":             _f(ece_ext),
+        "x_recall":                _f(x_recall) if not np.isnan(x_recall) else None,
+        "lead_median_min":         _f(lead["lead_median_min"], 1),
+        "lead_mean_min":           _f(lead["lead_mean_min"], 1),
         "n_flare_events_detected": int(lead["n_detected"]),
-        "opt_threshold":      _f(opt_t),
+        "n_onsets_total":          int(lead.get("n_onsets_total", 0)),
+        "n_onsets_skipped_boundary": int(lead.get("n_onsets_skipped_boundary", 0)),
+        "far_op_threshold":        _f(far_op_t),
+        "opt_threshold":           _f(opt_t),
     }
+
+    # Add diagnostic: minimum threshold at which any lead time is possible
+    if "min_threshold_for_lead" in lead:
+        metrics["min_threshold_for_lead"] = lead["min_threshold_for_lead"]
 
     if verbose:
         print(f"\n{'='*60}")
@@ -312,8 +383,16 @@ def evaluate_model(
         print(f"  ROC-AUC (30m) : {auc_val:.3f}")
         print(f"  ECE (30m)     : {ece_val:.3f}")
         print(f"  X-class recall: {x_recall:.3f}" if not np.isnan(x_recall) else "  X-class recall: N/A")
-        print(f"  Lead time     : median {lead['lead_median_min']:.1f} min  mean {lead['lead_mean_min']:.1f} min")
-        print(f"  Opt threshold : {opt_t:.3f}")
+        print(f"  Lead time     : median {lead['lead_median_min']:.1f} min  "
+              f"mean {lead['lead_mean_min']:.1f} min  "
+              f"(events: {lead['n_detected']}/{lead.get('n_onsets_total',0)-lead.get('n_onsets_skipped_boundary',0)} measurable)")
+        if lead.get("n_onsets_skipped_boundary", 0) > 0:
+            print(f"  ↳ {lead['n_onsets_skipped_boundary']} onset(s) at sequence start skipped "
+                  f"(day starts in M+ — no preceding windows)")
+        if "min_threshold_for_lead" in lead and lead["lead_median_min"] == 0.0:
+            print(f"  ↳ Pre-onset signal max p={lead['min_threshold_for_lead']:.4f} "
+                  f"vs FAR threshold {far_op_t:.4f} — signal present but below operating point")
+        print(f"  FAR threshold : {far_op_t:.3f}  (opt-F1: {opt_t:.3f})")
         print(f"{'='*60}\n")
 
     return metrics

@@ -1,0 +1,43 @@
+Let's try a different approach. Instead of hunting for another PRADAN day, let's diagnose why lead time is stuck at 0.0 specifically.
+
+The real problem
+Lead time = 0.0 doesn't mean the model fires at onset. It means the sliding window evaluation isn't running correctly on TEST.
+Here's why I think this: your VAL lead time was 28-30 minutes across v1 and v2. That's a real signal — the model genuinely fires early on 2024-05-10. If the architecture couldn't produce lead time at all, VAL would also be 0.0. The fact that VAL works and TEST doesn't points to an evaluation bug, not a training bug.
+
+Check this first before downloading anything
+Run this diagnostic on your TEST day specifically:
+pythonimport numpy as np
+
+# Load TEST windows
+X       = np.load("/tmp/X_v2.npy")
+y_bin   = np.load("/tmp/y_binary_v2.npy")
+splits  = np.load("/tmp/splits_v2.npy")
+
+test_mask = splits == 2
+X_test    = X[test_mask]
+y_test    = y_bin[test_mask]
+
+print(f"TEST windows     : {len(y_test)}")
+print(f"TEST M+ windows  : {y_test.sum()} ({100*y_test.mean():.1f}%)")
+print(f"TEST window shape: {X_test.shape}")
+
+# Check: are there ANY positive windows in TEST?
+# If 0, lead time computation has nothing to measure
+pos_idx = np.where(y_test == 1)[0]
+print(f"First positive window index: {pos_idx[0] if len(pos_idx) else 'NONE'}")
+print(f"Last positive window index : {pos_idx[-1] if len(pos_idx) else 'NONE'}")
+If positive window count is 0 → your v3 rebuild didn't correctly label TEST windows with the 60-minute horizon. The label horizon fix didn't propagate to the saved .npy files.
+If positive windows exist → the lead time computation function itself has a bug. Paste the output and I'll tell you exactly where.
+
+Also check your lead time function directly
+python# Load model predictions on TEST
+import json
+with open("/tmp/module4_ckpt_v3/test_results.json") as f:
+    results = json.load(f)
+
+print("Keys in results:", list(results.keys()))
+print("Lead times raw:", results.get("lead_times_minutes", "KEY MISSING"))
+print("Lead time median:", results.get("lead_time_median_minutes", "KEY MISSING"))
+If lead_times_minutes is an empty list [] → the function found no events to measure lead time on. That's the bug location.
+
+Run both diagnostics and paste the output.

@@ -1,2 +1,3 @@
 - [SoLEXS pipeline architecture](solexs-pipeline.md) — Modules 1-3 complete; key calibration bugs found and fixed
 - [Module 3 detector design](module3-detector.md) — Two-channel voter: excess_A + band_C (NOT hardness_ratio); adaptive CFAR thresholds on signal itself
+- [Module 4 lead-time evaluation bug](module4-lead-time.md) — Lead time=0 on TEST: real signal (p60=0.44) but below FAR threshold (0.78); fixed evaluate.py to use FAR threshold not F1-opt

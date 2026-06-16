@@ -58,6 +58,13 @@ LAMBDA_MULTICLASS = 0.3
 _MULTI_OFFSET = 2   # y_class - 2 → 0=C, 1=M, 2=X
 
 
+def _smooth_binary(y: torch.Tensor, epsilon: float) -> torch.Tensor:
+    """Label smoothing for binary targets: 1→(1-ε), 0→ε."""
+    if epsilon == 0.0:
+        return y
+    return y * (1.0 - epsilon) + (1.0 - y) * epsilon
+
+
 def _compute_loss(
     logit_binary:  torch.Tensor,   # (B, 3)
     logit_extreme: torch.Tensor,   # (B, 1)
@@ -68,13 +75,14 @@ def _compute_loss(
     bce_binary:    nn.BCEWithLogitsLoss,
     bce_extreme:   nn.BCEWithLogitsLoss,
     ce_class:      nn.CrossEntropyLoss,
+    label_smoothing: float = 0.0,
 ) -> Tuple[torch.Tensor, Dict[str, float]]:
 
-    # Binary M+ loss (all 3 horizon outputs)
-    loss_bin = bce_binary(logit_binary, y_binary)
+    # Binary M+ loss (all 3 horizon outputs) with optional label smoothing
+    loss_bin = bce_binary(logit_binary, _smooth_binary(y_binary, label_smoothing))
 
-    # Extreme X-class loss
-    loss_ext = bce_extreme(logit_extreme.squeeze(-1), y_extreme)
+    # Extreme X-class loss with optional label smoothing
+    loss_ext = bce_extreme(logit_extreme.squeeze(-1), _smooth_binary(y_extreme, label_smoothing))
 
     # Multiclass loss — only on windows with GOES class >= C
     mask_cplus = y_class >= _MULTI_OFFSET
@@ -101,14 +109,15 @@ def _compute_loss(
 # ---------------------------------------------------------------------------
 
 def train_one_epoch(
-    model:     SolarPatchTST,
-    loader:    DataLoader,
-    optimizer: torch.optim.Optimizer,
-    device:    torch.device,
-    bce_bin:   nn.BCEWithLogitsLoss,
-    bce_ext:   nn.BCEWithLogitsLoss,
-    ce_mc:     nn.CrossEntropyLoss,
-    grad_clip: float = 1.0,
+    model:           SolarPatchTST,
+    loader:          DataLoader,
+    optimizer:       torch.optim.Optimizer,
+    device:          torch.device,
+    bce_bin:         nn.BCEWithLogitsLoss,
+    bce_ext:         nn.BCEWithLogitsLoss,
+    ce_mc:           nn.CrossEntropyLoss,
+    grad_clip:       float = 1.0,
+    label_smoothing: float = 0.0,
 ) -> Dict[str, float]:
     model.train()
     totals: Dict[str, float] = {"loss": 0, "bin": 0, "extreme": 0, "mc": 0}
@@ -126,6 +135,7 @@ def train_one_epoch(
             logit_bin, logit_ext, logit_mc,
             y_binary, y_extreme, y_class,
             bce_bin, bce_ext, ce_mc,
+            label_smoothing=label_smoothing,
         )
         loss.backward()
         nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
@@ -144,25 +154,29 @@ def train_one_epoch(
 
 @torch.no_grad()
 def validate(
-    model:   SolarPatchTST,
-    loader:  DataLoader,
-    device:  torch.device,
-    bce_bin: nn.BCEWithLogitsLoss,
-    bce_ext: nn.BCEWithLogitsLoss,
-    ce_mc:   nn.CrossEntropyLoss,
-    stride_s: int = 60,
-    far_thr:  float = 0.5,
+    model:               SolarPatchTST,
+    loader:              DataLoader,
+    device:              torch.device,
+    bce_bin:             nn.BCEWithLogitsLoss,
+    bce_ext:             nn.BCEWithLogitsLoss,
+    ce_mc:               nn.CrossEntropyLoss,
+    stride_s:            int   = 60,
+    far_thr:             float = 0.5,
+    label_smoothing:     float = 0.0,
+    primary_horizon_idx: int   = 1,   # 0=15min, 1=30min, 2=60min
 ) -> Dict[str, float]:
     """
-    Returns validation loss + TPR @ FAR=0.5/hr on the 30-min binary head.
+    Returns validation loss + TPR @ FAR=0.5/hr on the selected binary head.
+
+    primary_horizon_idx selects which head drives early stopping:
+      1 = 30-min head (default), 2 = 60-min head (use with --horizon 60)
 
     Note: VAL partition (20240510) has 60.9% M+ prevalence — TPR will be
     optimistic. Flag this in evaluation reports.
     """
     model.eval()
-    all_probs_30  = []
-    all_yb30      = []
-    all_yext      = []
+    all_probs = []
+    all_yb    = []
     totals: Dict[str, float] = {"loss": 0, "bin": 0, "extreme": 0, "mc": 0}
     n_batches = 0
 
@@ -177,22 +191,22 @@ def validate(
             logit_bin, logit_ext, logit_mc,
             y_binary, y_extreme, y_class,
             bce_bin, bce_ext, ce_mc,
+            label_smoothing=label_smoothing,
         )
         for k in totals:
             totals[k] += parts[k]
         n_batches += 1
 
-        all_probs_30.append(torch.sigmoid(logit_bin[:, 1]).cpu().numpy())   # 30-min head
-        all_yb30.append(y_binary[:, 1].cpu().numpy())
-        all_yext.append(y_extreme.cpu().numpy())
+        all_probs.append(torch.sigmoid(logit_bin[:, primary_horizon_idx]).cpu().numpy())
+        all_yb.append(y_binary[:, primary_horizon_idx].cpu().numpy())
 
-    probs30 = np.concatenate(all_probs_30)
-    yb30    = np.concatenate(all_yb30)
+    probs = np.concatenate(all_probs)
+    yb    = np.concatenate(all_yb)
 
     # Observation time in hours for FAR computation
-    n_windows  = len(probs30)
-    obs_hours  = n_windows * stride_s / 3600.0
-    tpr_val    = tpr_at_far(probs30, yb30, far_thr=far_thr, obs_hours=obs_hours)
+    n_windows = len(probs)
+    obs_hours = n_windows * stride_s / 3600.0
+    tpr_val   = tpr_at_far(probs, yb, far_thr=far_thr, obs_hours=obs_hours)
 
     metrics = {k: v / max(n_batches, 1) for k, v in totals.items()}
     metrics["tpr_at_far"] = tpr_val
@@ -204,16 +218,18 @@ def validate(
 # ---------------------------------------------------------------------------
 
 def train_model(
-    model:          SolarPatchTST,
-    train_loader:   DataLoader,
-    val_loader:     DataLoader,
-    checkpoint_dir: str | Path = "/tmp/module4_ckpt",
-    n_epochs:       int        = 30,
-    lr:             float      = 1e-4,
-    weight_decay:   float      = 1e-4,
-    patience:       int        = 7,
-    device:         Optional[torch.device] = None,
-    verbose:        bool       = True,
+    model:               SolarPatchTST,
+    train_loader:        DataLoader,
+    val_loader:          DataLoader,
+    checkpoint_dir:      str | Path = "/tmp/module4_ckpt",
+    n_epochs:            int        = 30,
+    lr:                  float      = 1e-4,
+    weight_decay:        float      = 1e-4,
+    patience:            int        = 7,
+    device:              Optional[torch.device] = None,
+    verbose:             bool       = True,
+    label_smoothing:     float      = 0.0,
+    primary_horizon_idx: int        = 1,   # 0=15min, 1=30min, 2=60min
 ) -> Dict[str, list]:
     """
     Full training loop with early stopping on TPR @ FAR=0.5/hr.
@@ -254,10 +270,13 @@ def train_model(
         t0 = time.time()
 
         tr_m  = train_one_epoch(
-            model, train_loader, optimizer, device, bce_bin, bce_ext, ce_mc
+            model, train_loader, optimizer, device, bce_bin, bce_ext, ce_mc,
+            label_smoothing=label_smoothing,
         )
         val_m = validate(
-            model, val_loader, device, bce_bin, bce_ext, ce_mc
+            model, val_loader, device, bce_bin, bce_ext, ce_mc,
+            label_smoothing=label_smoothing,
+            primary_horizon_idx=primary_horizon_idx,
         )
         scheduler.step()
 

@@ -222,25 +222,30 @@ def compute_lead_times(
 # ---------------------------------------------------------------------------
 
 def evaluate_model(
-    model:      SolarPatchTST,
-    loader:     DataLoader,
-    device:     torch.device,
-    partition:  str     = "TEST",
-    stride_s:   int     = 60,
-    far_thr:    float   = 0.5,
-    verbose:    bool    = True,
-    val_caveat: bool    = False,
+    model:       SolarPatchTST,
+    loader:      DataLoader,
+    device:      torch.device,
+    partition:   str   = "TEST",
+    stride_s:    int   = 60,
+    far_thr:     float = 0.5,
+    verbose:     bool  = True,
+    val_caveat:  bool  = False,
+    horizon_idx: int   = 1,   # 0=15min, 1=30min, 2=60min — primary head to evaluate
 ) -> Dict[str, float]:
     """
     Full evaluation suite for one data partition.
 
+    horizon_idx selects the binary output head to evaluate:
+      1 = 30-min head (default), 2 = 60-min head (use with --horizon 60)
+
     Returns a flat dict of metrics.
     """
-    preds = run_inference(model, loader, device)
-    p30   = preds["prob_30"]
-    yb30  = preds["y_binary"][:, 1]
-    yext  = preds["y_extreme"]
-    yc    = preds["y_class"]
+    _PROB_KEYS = ["prob_15", "prob_30", "prob_60"]
+    preds  = run_inference(model, loader, device)
+    p30    = preds[_PROB_KEYS[horizon_idx]]   # primary horizon probabilities
+    yb30   = preds["y_binary"][:, horizon_idx]
+    yext   = preds["y_extreme"]
+    yc     = preds["y_class"]
 
     n_windows  = len(p30)
     obs_hours  = n_windows * stride_s / 3600.0

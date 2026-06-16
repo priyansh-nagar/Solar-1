@@ -63,8 +63,19 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--lr",         default=1e-4, type=float)
     p.add_argument("--dropout",    default=0.2,  type=float)
     p.add_argument("--patience",   default=7,    type=int)
-    p.add_argument("--no-shap",    action="store_true")
-    p.add_argument("--device",     default="auto", type=str)
+    p.add_argument("--no-shap",         action="store_true")
+    p.add_argument("--device",          default="auto",        type=str)
+    p.add_argument("--horizon",         default=30,  type=int,
+                   choices=[15, 30, 60],
+                   help="Primary forecast horizon in minutes (default 30). "
+                        "Use 60 to teach the model to fire earlier.")
+    p.add_argument("--label-smoothing", default=0.0, type=float,
+                   help="Label smoothing ε for binary/extreme BCE losses "
+                        "(0=off, 0.1 recommended). Reduces overconfidence and ECE.")
+    p.add_argument("--calibration",     default="temperature",
+                   choices=["temperature", "isotonic"],
+                   help="Post-hoc calibration method (default temperature). "
+                        "Use isotonic to fix prior mismatch between TRAIN/TEST.")
     p.add_argument(
         "--synthetic", action="store_true",
         help=(
@@ -193,11 +204,15 @@ def main():
     if args.synthetic:
         print(f"  ⚠  SYNTHETIC DATA MODE — for smoke-testing only")
     print(f"{'='*60}")
+    # Derive horizon_idx from --horizon flag: 15→0, 30→1, 60→2
+    horizon_idx = {15: 0, 30: 1, 60: 2}[args.horizon]
+
     print(f"  Device      : {device}")
     print(f"  Data dir    : {args.data_dir}")
     print(f"  Checkpoint  : {args.ckpt_dir}")
     print(f"  d_model={args.d_model}  n_heads={args.n_heads}  n_layers={args.n_layers}")
     print(f"  lr={args.lr}  batch={args.batch}  patience={args.patience}")
+    print(f"  horizon={args.horizon}min  label_smoothing={args.label_smoothing}  calibration={args.calibration}")
     print()
 
     # ── Generate synthetic data if requested ─────────────────────────────────
@@ -244,15 +259,17 @@ def main():
     from pipeline.module4.train import train_model
 
     history = train_model(
-        model         = model,
-        train_loader  = tr_loader,
-        val_loader    = val_loader,
-        checkpoint_dir= args.ckpt_dir,
-        n_epochs      = args.epochs,
-        lr            = args.lr,
-        patience      = args.patience,
-        device        = device,
-        verbose       = True,
+        model                = model,
+        train_loader         = tr_loader,
+        val_loader           = val_loader,
+        checkpoint_dir       = args.ckpt_dir,
+        n_epochs             = args.epochs,
+        lr                   = args.lr,
+        patience             = args.patience,
+        device               = device,
+        verbose              = True,
+        label_smoothing      = args.label_smoothing,
+        primary_horizon_idx  = horizon_idx,
     )
 
     # Save history
@@ -268,10 +285,12 @@ def main():
     val_metrics = evaluate_model(
         model, val_loader, device,
         partition="VAL", verbose=True, val_caveat=True,
+        horizon_idx=horizon_idx,
     )
     te_metrics = evaluate_model(
         model, te_loader, device,
         partition="TEST", verbose=True,
+        horizon_idx=horizon_idx,
     )
 
     all_metrics = {"val": val_metrics, "test": te_metrics}
@@ -279,26 +298,37 @@ def main():
         json.dump(all_metrics, f, indent=2)
     print("Metrics saved.")
 
-    # ── Temperature scaling ──────────────────────────────────────────────────
-    print("\nFitting temperature scaler on VAL …")
-    from pipeline.module4.calibrate import TemperatureScaler
+    # ── Calibration ──────────────────────────────────────────────────────────
+    from pipeline.module4.evaluate import ece as compute_ece
 
-    ts = TemperatureScaler(model).fit(val_loader, device, verbose=True)
-    ts_path = str(ckpt_dir / "temperature.pt")
-    ts.save(ts_path)
-    print(f"Temperature = {ts.temperature_value():.4f}  saved to {ts_path}")
+    if args.calibration == "temperature":
+        print("\nFitting temperature scaler on VAL …")
+        from pipeline.module4.calibrate import TemperatureScaler
 
-    # Post-calibration ECE on TEST
-    from pipeline.module4.evaluate import run_inference, ece as compute_ece
-    from pipeline.module4.model    import SolarPatchTST as _M
+        cal = TemperatureScaler(model)
+        cal.fit(val_loader, device, verbose=True, horizon_idx=horizon_idx)
+        cal_path = str(ckpt_dir / "temperature.pt")
+        cal.save(cal_path)
+        print(f"Temperature = {cal.temperature_value():.4f}  saved to {cal_path}")
+        cal_preds = cal.predict_30min(te_loader, device, horizon_idx=horizon_idx)
 
-    cal_preds = ts.predict_30min(te_loader, device)
+    else:  # isotonic
+        print("\nFitting isotonic calibrator on VAL …")
+        from pipeline.module4.calibrate import IsotonicCalibrator
+
+        cal = IsotonicCalibrator(model, horizon_idx=horizon_idx)
+        cal.fit(val_loader, device, verbose=True)
+        cal_path = str(ckpt_dir / "isotonic_calibrator.pkl")
+        cal.save(cal_path)
+        print(f"Isotonic calibrator saved to {cal_path}")
+        cal_preds = cal.predict_loader(te_loader, device)
+
     ece_after = compute_ece(
         cal_preds["prob_30_calibrated"],
         cal_preds["y_true_30"],
     )
     print(f"TEST ECE after calibration: {ece_after:.4f}")
-    te_metrics["ece_30min_calibrated"] = round(ece_after, 4)
+    te_metrics["ece_30min_calibrated"] = round(float(ece_after), 4)
 
     # ── SHAP ─────────────────────────────────────────────────────────────────
     if not args.no_shap:

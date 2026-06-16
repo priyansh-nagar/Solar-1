@@ -1,0 +1,71 @@
+Show more
+16:27
+Great analysis. Let me give you the exact diagnosis and fix for both.
+
+Lead time = 0.0 min — Root cause and fix
+Your VAL lead time was 28 minutes but TEST collapsed to zero. This is a generalisation problem, not a model architecture problem.
+
+Here's exactly what happened:
+
+Your TRAIN set has X6.4, X4.5, and M9 events — all extremely energetic flares with dramatic precursor signatures. The model learned "precursor = large excess_A rise starting 20-30 minutes before peak."
+
+The TEST day (2024-02-09, X3.4) has a more subtle precursor. The pre-flare rise is slower and smaller in magnitude. The model only recognises it as a flare when the flux is already rising steeply — which is after onset, giving you zero additional lead time over Module 3.
+
+Three fixes, apply all three together:
+
+Fix 1 — Extend label horizon to 60 minutes.
+Your current 30-minute horizon means a window is only labelled positive if a flare occurs within 30 minutes. A window 45 minutes before the X3.4 onset gets labelled negative during training. Extending to 60 minutes labels those earlier windows positive, teaching the model to fire earlier.
+
+Fix 2 — Add label smoothing ε=0.1.
+Hard labels (0 or 1) make the model overconfident on training examples it's seen. Label smoothing replaces 1→0.9 and 0→0.1, forcing the model to maintain uncertainty. This directly attacks your ECE problem simultaneously.
+
+Fix 3 — Add the M-class precursor days explicitly.
+2024-02-09 has M3-M4 precursor events before the X3.4. Those precursor windows in your TEST set are the signal the model needs to see in training. Download one additional moderate flare day — try 2024-03-23 (X1.1) or 2024-09-30 (M7) — and add it to TRAIN. More diversity in training flare morphology = better generalisation to TEST.
+
+ECE = 0.198 — Root cause and fix
+Temperature scaling only moved ECE by 0.005 because temperature scaling only fixes scale miscalibration — it learns one scalar T and divides all logits by it. Your problem is distributional miscalibration.
+
+Your TEST set is 19.3% M+ but your TRAIN set is 31.8% M+. The model learned a prior of ~32% flare rate. When it sees TEST data at 19.3% rate, its probabilities are systematically too high — it's overcounting flares. Temperature scaling can't fix a prior mismatch.
+
+Two fixes:
+
+Fix 1 — Use isotonic regression calibration instead of temperature scaling.
+Isotonic regression is a non-parametric calibrator that can fix non-monotonic miscalibration, not just scale. It fits a step function mapping raw probabilities to calibrated ones. Sklearn has it built in:
+
+python
+from sklearn.calibration import CalibratedClassifierCV
+# Or directly:
+from sklearn.isotonic import IsotonicRegression
+
+ir = IsotonicRegression(out_of_bounds='clip')
+ir.fit(val_probs, val_labels)
+calibrated_test_probs = ir.predict(test_probs)
+Fix 2 — Label smoothing ε=0.1 (same fix as lead time above).
+This reduces overconfidence during training itself, making the calibration step's job much easier. ECE typically drops 30-50% when label smoothing is combined with isotonic regression.
+
+Exact retraining command
+Change these three things in your config and retrain:
+
+python
+LABEL_HORIZON_S   = 3600   # was 1800 (30 min) → now 60 min
+LABEL_SMOOTHING   = 0.1    # was 0.0
+CALIBRATION       = "isotonic"  # was "temperature"
+Then retrain:
+
+bash
+python pipeline/scripts/train_module4.py \
+    --data-dir /tmp \
+    --ckpt-dir /tmp/module4_ckpt_v2 \
+    --horizon 60 \
+    --label-smoothing 0.1 \
+    --calibration isotonic
+Expected results after retraining
+Metric	Current	Expected after fix
+TPR@FAR0.5	0.797	0.78-0.82 (stable)
+Lead time	0.0 min	5-15 min
+X-class recall	0.501	0.55-0.70
+ECE after calibration	0.198	0.06-0.10
+Best epoch	13	12-18
+TPR might drop very slightly because a 60-minute horizon is harder to predict — that's acceptable. Lead time and ECE should improve significantly.
+
+Run the retrain and share the five numbers again.

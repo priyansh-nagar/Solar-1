@@ -103,6 +103,42 @@ BINARY_MIN_CLASS = 3   # 0=A, 1=B, 2=C, 3=M, 4=X  → M+ = flare
 
 
 # ---------------------------------------------------------------------------
+# Multi-horizon label helper
+# ---------------------------------------------------------------------------
+
+def _horizon_binary(
+    goes_class:    np.ndarray,
+    window_starts: np.ndarray,
+    window_s:      int,
+    horizon_s:     int,
+    min_class:     int,
+    n_cad:         int,
+) -> np.ndarray:
+    """
+    Compute a binary M+/X label for each window using a different look-ahead horizon.
+
+    For window starting at cadence w, the label = 1 iff
+        max( goes_class[ w+window_s : w+window_s+horizon_s ] ) >= min_class
+
+    Parameters
+    ----------
+    goes_class    : (N_cadences,) per-cadence GOES class integer
+    window_starts : (n_windows,) start cadence of each window
+    window_s      : window length in cadences (1800)
+    horizon_s     : look-ahead horizon in cadences (900 / 1800 / 3600)
+    min_class     : minimum GOES class integer for a positive label (3=M, 4=X)
+    n_cad         : total cadence count (len(goes_class))
+    """
+    labels = np.zeros(len(window_starts), dtype=np.int8)
+    for i, w in enumerate(window_starts):
+        s = int(w) + window_s
+        e = min(s + horizon_s, n_cad)
+        if e > s:
+            labels[i] = int(np.nanmax(goes_class[s:e]) >= min_class)
+    return labels
+
+
+# ---------------------------------------------------------------------------
 # Single-day processor
 # ---------------------------------------------------------------------------
 
@@ -198,6 +234,18 @@ def process_day(
     # The original C+ threshold (y_class >= 2) was degenerate on these days.
     y_binary_mp = (wd.y_class >= BINARY_MIN_CLASS).astype(np.int8)
 
+    # ── Multi-horizon labels (15 / 60 min M+, 30 min X-class) ─────────────
+    gc    = feat_dict.get("goes_class")
+    n_cad = len(gc) if gc is not None else 0
+    if gc is not None and hasattr(wd, "window_starts") and n_cad > 0:
+        y_15min  = _horizon_binary(gc, wd.window_starts, WINDOW_S, 900,  BINARY_MIN_CLASS, n_cad)
+        y_60min  = _horizon_binary(gc, wd.window_starts, WINDOW_S, 3600, BINARY_MIN_CLASS, n_cad)
+        y_extreme = _horizon_binary(gc, wd.window_starts, WINDOW_S, LABEL_HORIZON_S, 4, n_cad)
+    else:
+        y_15min   = y_binary_mp.copy()
+        y_60min   = y_binary_mp.copy()
+        y_extreme = (wd.y_class >= 4).astype(np.int8)
+
     elapsed = time.perf_counter() - t0
     cls_names = ["A", "B", "C", "M", "X"]
     n_total = len(wd.y_class)
@@ -215,14 +263,18 @@ def process_day(
     )
 
     return {
-        "X":        wd.X,
-        "y_binary": y_binary_mp,
-        "y_class":  wd.y_class,
-        "splits":   day_splits,
-        "n_total":  n_total,
-        "n_mp":     n_mp,
-        "label":    label,
-        "source":   source,
+        "X":            wd.X,
+        "y_binary":     y_binary_mp,
+        "y_class":      wd.y_class,
+        "splits":       day_splits,
+        "y_15min":      y_15min,
+        "y_60min":      y_60min,
+        "y_extreme":    y_extreme,
+        "feature_names": wd.feature_names,
+        "n_total":      n_total,
+        "n_mp":         n_mp,
+        "label":        label,
+        "source":       source,
         "assigned_split": assigned_split,
     }
 
@@ -397,6 +449,19 @@ def _finish(results: list) -> None:
     np.save(out_dir / "y_binary_v2.npy", y_binary)
     np.save(out_dir / "y_class_v2.npy",  y_class)
     np.save(out_dir / "splits_v2.npy",   splits)
+
+    # Multi-horizon labels
+    y_15min  = np.concatenate([r["y_15min"]  for r in results], axis=0)
+    y_60min  = np.concatenate([r["y_60min"]  for r in results], axis=0)
+    y_extreme = np.concatenate([r["y_extreme"] for r in results], axis=0)
+    np.save(out_dir / "y_15min_v2.npy",  y_15min)
+    np.save(out_dir / "y_60min_v2.npy",  y_60min)
+    np.save(out_dir / "y_extreme_v2.npy", y_extreme)
+
+    # Feature names
+    feature_names = results[0].get("feature_names", [])
+    with open(out_dir / "feature_names_v2.json", "w") as f:
+        json.dump(feature_names, f)
 
     # Focal loss parameters for M+ binary and multiclass
     tr_mp  = tr.get("M+", 1)
